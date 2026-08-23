@@ -1,0 +1,648 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 7f4e252dc..06e235300 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -848,8 +848,20 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
+         return -1;
+     }
+ 
++    // Qwen3.5-122B R1: HOTEXPERT_CACHE makes ROCm_Host visible to the GPU,
++    // but ordinary cold MMID nodes must remain on CPU. Only the explicitly
++    // named resident branch is allowed to prefer a non-CPU backend for a host
++    // weight. Explicit scheduler pinning still decides that branch later.
++    const char * q122_r1 = std::getenv("Q122_R1");
++    const bool q122_r1_active = q122_r1 && strcmp(q122_r1, "1") == 0;
++    const bool q122_r1_gpu_node = op && strstr(op->name, "q122_r1_gpu_") != nullptr;
++    const bool q122_r1_force_cpu_host = q122_r1_active && ggml_backend_buffer_is_host(buffer) && !q122_r1_gpu_node;
++
+     // find highest prio backend that supports the buffer type and the op
+     for (int i = 0; i < sched->n_backends; i++) {
++        if (q122_r1_force_cpu_host && ggml_backend_dev_type(ggml_backend_get_device(sched->backends[i])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            continue;
++        }
+         if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
+             ggml_backend_supports_op(sched->backends[i], op)) {
+             return i;
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 491316f74..ae0599883 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1455,6 +1455,120 @@ UseGgmlGemm2:;
+ 
+ #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
+ 
++
++// Qwen3.5-122B Resident/Miss Split R0 upper-bound experiment.
++// Q122_R0_SKIP_SLOTS=N pretends the long-profile top-N experts are already
++// computed by a zero-cost GPU resident path. CPU MMID skips them and clears
++// their output slice. This intentionally changes model output and is disabled
++// by default; it exists only in the isolated q122 worktree.
++#include "q122-r0-rank.inc"
++
++static atomic_ullong q122_r0_rows_total = 0;
++static atomic_ullong q122_r0_rows_skipped = 0;
++
++static int q122_r0_skip_slots(void) {
++    static int initialized = 0;
++    static int slots = 0;
++    if (!initialized) {
++        const char * v = getenv("Q122_R0_SKIP_SLOTS");
++        if (v && *v) {
++            slots = atoi(v);
++            if (slots < 0) slots = 0;
++            if (slots > 32) slots = 32;
++        }
++        initialized = 1;
++    }
++    return slots;
++}
++
++static int q122_r0_parse_layer(const char * name) {
++    if (!name) return -1;
++    const char * p = strstr(name, "blk.");
++    if (!p) return -1;
++    p += 4;
++    if (*p < '0' || *p > '9') return -1;
++    int layer = 0;
++    while (*p >= '0' && *p <= '9') layer = layer * 10 + (*p++ - '0');
++    return layer >= 0 && layer < 48 ? layer : -1;
++}
++
++static atomic_int q122_r1_layers_state = 0;
++static bool q122_r1_layers_mask[48] = { false };
++static bool q122_r1_active_cached = false;
++
++static void q122_r1_layers_init(void) {
++    int state = atomic_load_explicit(&q122_r1_layers_state, memory_order_acquire);
++    if (state == 2) return;
++    int expected = 0;
++    if (atomic_compare_exchange_strong_explicit(&q122_r1_layers_state, &expected, 1, memory_order_acq_rel, memory_order_acquire)) {
++        const char * enabled = getenv("Q122_R1");
++        q122_r1_active_cached = enabled && strcmp(enabled, "1") == 0;
++        if (q122_r1_active_cached) {
++            const char * list = getenv("Q122_R1_SPLIT_LAYERS");
++            if (list && *list) {
++                const char * p = list;
++                while (*p) {
++                    while (*p == ' ' || *p == ',') ++p;
++                    if (!*p) break;
++                    char * end = NULL;
++                    long layer = strtol(p, &end, 10);
++                    if (end == p) break;
++                    if (layer >= 0 && layer < 48) q122_r1_layers_mask[layer] = true;
++                    p = end;
++                }
++            } else {
++                const char * v = getenv("Q122_R1_SPLIT_LAYER");
++                int layer = (v && *v) ? atoi(v) : 3;
++                if (layer >= 0 && layer < 48) q122_r1_layers_mask[layer] = true;
++            }
++        }
++        atomic_store_explicit(&q122_r1_layers_state, 2, memory_order_release);
++    } else {
++        while (atomic_load_explicit(&q122_r1_layers_state, memory_order_acquire) != 2) { }
++    }
++}
++
++static bool q122_r1_active(void) {
++    q122_r1_layers_init();
++    return q122_r1_active_cached;
++}
++
++static bool q122_r1_layer_enabled(int layer) {
++    q122_r1_layers_init();
++    return q122_r1_active_cached && layer >= 0 && layer < 48 && q122_r1_layers_mask[layer];
++}
++
++static bool q122_r0_is_resident(const struct ggml_tensor * tensor, int expert) {
++    const int slots = q122_r0_skip_slots();
++    if (slots <= 0 || !tensor || expert < 0 || expert >= 256) return false;
++    const int layer = q122_r0_parse_layer(tensor->name);
++    if (layer < 0) return false;
++    if (q122_r1_active() && !q122_r1_layer_enabled(layer)) return false;
++    if (!strstr(tensor->name, "ffn_") || !strstr(tensor->name, "_exps")) return false;
++    for (int i = 0; i < slots; ++i) if (q122_r0_rank[layer][i] == expert) return true;
++    return false;
++}
++
++static void q122_r0_report(void) {
++    const uint64_t total = atomic_load_explicit(&q122_r0_rows_total, memory_order_relaxed);
++    const uint64_t skipped = atomic_load_explicit(&q122_r0_rows_skipped, memory_order_relaxed);
++    if (q122_r0_skip_slots() > 0) {
++        fprintf(stderr, "Q122 R0 summary: slots=%d rows_total=%llu rows_skipped=%llu skip_pct=%.2f\n",
++            q122_r0_skip_slots(), (unsigned long long) total, (unsigned long long) skipped,
++            total ? 100.0 * (double) skipped / (double) total : 0.0);
++    }
++}
++
++static void q122_r0_init_once(void) {
++    static atomic_bool done = false;
++    if (q122_r0_skip_slots() <= 0) return;
++    bool expected = false;
++    if (atomic_compare_exchange_strong_explicit(&done, &expected, true, memory_order_relaxed, memory_order_relaxed)) {
++        atexit(q122_r0_report);
++        fprintf(stderr, "Q122 R0: CPU MMID resident-skip enabled slots=%d\n", q122_r0_skip_slots());
++    }
++}
++
+ struct mmid_row_mapping {
+     int32_t i1;
+     int32_t i2;
+@@ -1651,6 +1765,27 @@ static void ggml_compute_forward_mul_mat_id(
+             continue;
+         }
+ 
++        q122_r0_init_once();
++        const bool q122_r1_cpu_branch = !q122_r1_active() ||
++            strstr(dst->name, "q122_r1_cpu_") != NULL;
++        const bool q122_r0_skip = q122_r1_cpu_branch && q122_r0_is_resident(src0, cur_a);
++        if (ith == 0) {
++            atomic_fetch_add_explicit(&q122_r0_rows_total, (uint64_t) cne1, memory_order_relaxed);
++            if (q122_r0_skip) {
++                atomic_fetch_add_explicit(&q122_r0_rows_skipped, (uint64_t) cne1, memory_order_relaxed);
++            }
++        }
++        if (q122_r0_skip) {
++            const int64_t z0 = (ith * ne01) / nth;
++            const int64_t z1 = ((ith + 1) * ne01) / nth;
++            for (int64_t zr = 0; zr < cne1; ++zr) {
++                const struct mmid_row_mapping m = MMID_MATRIX_ROW(cur_a, zr);
++                float * out = (float *) ((char *) dst->data + (m.i1 * nb1 + m.i2 * nb2));
++                memset(out + z0, 0, (size_t) (z1 - z0) * sizeof(float));
++            }
++            continue;
++        }
++
+         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+diff --git a/ggml/src/ggml-cpu/q122-r0-rank.inc b/ggml/src/ggml-cpu/q122-r0-rank.inc
+new file mode 100644
+index 000000000..633c22eea
+--- /dev/null
++++ b/ggml/src/ggml-cpu/q122-r0-rank.inc
+@@ -0,0 +1,50 @@
++static const int q122_r0_rank[48][32] = {
++  {236,252,94,210,206,49,125,62,113,249,55,159,235,180,106,147,240,175,126,39,1,108,220,45,223,136,151,200,87,30,169,140},
++  {49,95,18,244,170,156,17,238,255,37,104,129,58,101,30,206,55,40,193,133,176,242,227,59,8,11,63,249,165,111,80,1},
++  {10,248,220,21,224,52,31,8,44,80,42,25,23,6,151,172,121,64,131,218,120,239,76,46,34,204,181,136,7,130,137,24},
++  {209,144,190,149,49,191,212,6,82,38,137,217,138,236,2,250,54,29,25,102,189,46,32,125,69,0,21,231,24,220,158,72},
++  {212,75,218,57,98,191,6,254,4,3,62,87,12,115,82,133,15,91,49,9,20,223,186,2,0,162,64,244,157,43,28,219},
++  {202,192,2,148,56,167,28,180,174,0,205,5,140,221,40,30,231,188,8,224,113,55,161,82,195,130,76,146,108,17,253,91},
++  {101,229,220,236,212,11,87,75,173,13,241,225,127,5,140,91,228,223,114,55,216,200,251,25,30,203,106,26,53,185,97,232},
++  {28,31,13,190,225,95,218,142,56,108,15,201,65,222,255,241,16,193,126,235,19,58,128,181,194,159,70,228,245,154,211,217},
++  {34,11,50,27,118,52,102,174,255,211,236,12,250,82,114,84,73,207,217,25,244,104,222,227,13,179,125,9,55,6,132,166},
++  {140,162,205,27,152,171,6,84,91,50,203,67,179,24,176,80,160,158,200,101,59,1,126,146,174,93,117,75,30,157,253,31},
++  {163,32,33,255,244,196,42,22,87,25,174,177,82,44,243,50,236,88,75,58,137,140,217,36,135,76,191,109,41,1,178,125},
++  {167,224,54,112,127,87,215,14,32,109,206,147,55,16,199,51,189,222,175,57,210,125,214,117,123,17,9,140,25,88,15,63},
++  {24,171,128,49,4,28,247,129,224,0,168,13,114,43,227,57,115,61,149,140,102,1,177,239,199,133,95,141,188,161,154,205},
++  {6,120,113,242,203,119,52,117,57,43,86,40,26,205,191,167,99,218,51,116,143,46,50,104,80,106,102,255,125,93,201,115},
++  {128,199,145,0,40,34,251,168,239,183,92,225,254,13,81,55,162,204,138,220,80,189,11,31,151,237,2,7,210,112,28,49},
++  {75,119,209,46,172,43,51,110,122,180,123,31,36,197,54,76,214,82,194,4,243,199,90,168,100,1,216,21,148,247,57,217},
++  {32,89,119,224,141,158,33,22,51,233,86,53,17,1,217,93,54,39,46,166,72,102,197,185,165,218,167,41,59,231,55,56},
++  {14,33,248,197,250,37,238,0,245,230,157,103,11,226,195,232,203,180,58,87,78,215,213,1,114,110,156,173,47,38,101,255},
++  {171,30,22,228,75,119,240,204,80,13,216,66,5,36,197,35,106,143,47,100,167,61,148,131,124,77,208,102,31,27,117,53},
++  {0,235,77,145,65,152,225,136,87,132,155,6,91,27,40,247,176,20,240,140,196,109,83,37,82,67,194,53,75,12,226,142},
++  {62,219,238,100,104,208,69,194,221,80,27,156,160,169,216,212,197,198,56,12,218,74,71,108,166,119,129,189,231,148,105,181},
++  {217,212,178,242,229,108,205,79,31,97,81,180,210,249,83,37,3,245,25,1,36,120,161,0,57,225,91,133,32,163,186,159},
++  {33,106,189,149,134,17,131,222,87,57,118,203,34,107,250,42,1,22,126,199,103,194,155,77,193,12,228,180,242,79,227,219},
++  {107,210,228,255,135,44,19,17,227,221,185,48,245,109,60,82,164,47,79,103,197,186,111,236,22,32,172,146,7,1,233,113},
++  {107,168,233,70,232,234,239,219,12,8,9,86,217,3,17,44,242,57,109,11,36,118,89,34,199,152,189,140,56,148,253,178},
++  {46,63,219,226,218,93,184,254,166,244,120,104,189,23,167,17,213,42,19,117,190,12,230,107,35,150,56,215,253,165,84,239},
++  {231,188,74,43,126,12,192,141,9,24,46,72,111,212,55,66,159,143,195,25,130,170,160,31,22,0,17,27,45,157,94,216},
++  {216,252,113,60,134,119,38,178,123,64,101,202,137,246,1,76,19,170,77,197,33,129,204,47,104,6,48,182,100,0,207,9},
++  {185,148,67,59,40,150,176,203,184,132,0,193,125,251,76,10,144,168,133,204,116,28,63,151,162,30,42,31,15,27,77,82},
++  {11,140,90,189,182,21,153,73,203,201,23,45,16,99,28,188,200,249,61,89,215,152,128,162,206,105,55,102,246,51,235,130},
++  {10,8,156,176,228,128,91,122,0,108,250,84,131,147,67,202,208,126,151,112,199,143,134,152,123,180,231,240,171,109,9,41},
++  {124,60,8,230,76,173,229,205,94,65,219,23,89,6,154,130,222,36,135,86,99,148,20,52,198,240,66,151,118,95,4,2},
++  {189,202,65,5,138,80,252,176,208,187,85,165,225,96,145,236,255,27,203,199,178,92,84,94,135,188,249,44,241,196,193,75},
++  {16,154,167,133,132,153,168,7,101,10,8,9,79,1,215,200,252,179,124,242,84,58,31,185,45,229,40,35,39,249,183,199},
++  {82,79,114,119,78,164,138,14,106,149,97,60,26,155,194,122,93,16,71,63,191,170,1,154,22,130,157,87,144,101,148,254},
++  {32,76,91,63,201,92,112,221,249,67,139,26,231,0,52,42,254,181,210,197,61,57,180,16,168,239,204,140,233,154,84,107},
++  {221,148,112,219,153,140,9,23,136,10,122,231,154,32,215,172,114,245,104,133,116,54,120,13,152,47,113,103,196,40,195,168},
++  {47,59,207,208,144,186,17,105,135,72,228,26,82,92,97,223,88,218,175,104,36,237,8,27,38,248,10,183,163,71,232,166},
++  {47,59,17,15,38,112,33,159,140,96,21,27,124,80,16,191,32,28,22,25,250,14,82,199,81,187,206,135,203,251,228,127},
++  {76,29,31,250,138,245,114,94,26,24,7,243,162,188,172,72,242,241,107,54,230,120,140,121,12,161,23,173,192,96,45,238},
++  {241,151,128,132,7,214,195,164,144,5,90,96,218,29,227,64,61,245,51,65,74,162,68,188,4,247,130,54,70,142,53,193},
++  {189,7,45,217,18,89,173,84,102,221,104,191,201,1,150,25,48,172,125,38,59,14,180,95,157,36,212,10,121,187,232,78},
++  {250,62,105,174,160,23,216,118,141,92,38,115,207,177,74,102,214,136,128,180,33,149,146,20,179,0,202,47,86,166,108,148},
++  {114,141,202,131,54,89,227,88,241,48,169,184,28,32,55,3,29,111,45,124,35,221,254,204,85,207,108,255,62,5,174,194},
++  {45,67,194,47,76,139,150,81,83,249,44,21,37,84,33,153,167,244,107,86,122,57,234,165,8,110,121,15,94,22,102,116},
++  {132,244,95,215,246,155,39,198,209,170,207,144,210,173,121,171,109,118,100,231,2,249,177,54,229,122,203,216,75,17,223,30},
++  {179,235,187,210,25,29,230,61,228,39,38,182,86,204,143,247,243,7,159,21,6,142,153,151,205,52,192,88,99,213,166,180},
++  {48,184,142,72,32,208,190,153,167,13,77,176,42,52,74,206,87,20,17,97,129,105,83,217,1,73,198,155,188,101,247,166},
++};
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 875956f19..c7833d9b5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2742,6 +2742,21 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+ 
++    if (std::strstr(dst->name, "q122_r1_gpu_") != nullptr) {
++        static int q122_r1_gpu_diag = 0;
++        if (q122_r1_gpu_diag < 12) {
++            ++q122_r1_gpu_diag;
++            const int mmvq_max_dbg = ggml_is_quantized(src0->type) ? get_mmvq_mmid_max_batch(src0->type, cc) : -1;
++            std::fprintf(stderr,
++                "Q122_R1_GPU_MMID name=%s src0=%s buft=%s host=%d ne2=%lld ne12=%lld mmvq_max=%d type=%s\n",
++                dst->name, src0->name,
++                src0->buffer ? ggml_backend_buffer_name(src0->buffer) : "NULL",
++                src0->buffer ? (ggml_backend_buffer_is_host(src0->buffer) ? 1 : 0) : -1,
++                (long long) ne2, (long long) ne12, mmvq_max_dbg, ggml_type_name(src0->type));
++            std::fflush(stderr);
++        }
++    }
++
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+@@ -6084,6 +6099,15 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+ 
++    // Qwen3.5-122B R1 owns placement explicitly at graph level. HOTEXPERT_CACHE
++    // remains enabled only so the pinned resident branch can use ROCm_Host
++    // weights without copying; it must not make every cold Host MMID eligible
++    // for automatic GPU offload.
++    const char * q122_r1 = std::getenv("Q122_R1");
++    if (q122_r1 && std::strcmp(q122_r1, "1") == 0) {
++        return false;
++    }
++
+     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/hotexpert-cache.cu b/ggml/src/ggml-cuda/hotexpert-cache.cu
+index 9b41c2fd2..7684b05ce 100644
+--- a/ggml/src/ggml-cuda/hotexpert-cache.cu
++++ b/ggml/src/ggml-cuda/hotexpert-cache.cu
+@@ -51,6 +51,50 @@ static bool env_enabled() {
+     return value && std::strcmp(value, "1") == 0;
+ }
+ 
++
++static bool q122_r1_active() {
++    static const bool active = [] {
++        const char * enabled = std::getenv("Q122_R1");
++        return enabled && std::strcmp(enabled, "1") == 0;
++    }();
++    return active;
++}
++
++static const std::array<bool, MAX_LAYERS> & q122_r1_layers() {
++    static const std::array<bool, MAX_LAYERS> mask = [] {
++        std::array<bool, MAX_LAYERS> out{};
++        if (!q122_r1_active()) return out;
++        const char * list = std::getenv("Q122_R1_SPLIT_LAYERS");
++        if (list && *list) {
++            const char * p = list;
++            while (*p) {
++                while (*p == ' ' || *p == ',') ++p;
++                if (!*p) break;
++                char * end = nullptr;
++                long layer = std::strtol(p, &end, 10);
++                if (end == p) break;
++                if (layer >= 0 && layer < MAX_LAYERS) out[size_t(layer)] = true;
++                p = end;
++            }
++        } else {
++            const char * value = std::getenv("Q122_R1_SPLIT_LAYER");
++            int layer = (value && *value) ? std::atoi(value) : 3;
++            if (layer >= 0 && layer < MAX_LAYERS) out[size_t(layer)] = true;
++        }
++        return out;
++    }();
++    return mask;
++}
++
++static bool q122_r1_layer_enabled(int layer) {
++    return q122_r1_active() && layer >= 0 && layer < MAX_LAYERS && q122_r1_layers()[size_t(layer)];
++}
++
++static bool q122_r1_resident_only(int layer) {
++    const char * value = std::getenv("Q122_R1_RESIDENT_ONLY");
++    return value && std::strcmp(value, "1") == 0 && q122_r1_layer_enabled(layer);
++}
++
+ static int env_positive_int(const char * name, int fallback) {
+     const char * value = std::getenv(name);
+     if (!value || !*value) {
+@@ -171,6 +215,21 @@ static void initialize(cache_state & s) {
+ 
+ const void * const * ggml_cuda_hotexpert_cache_get(
+         const ggml_tensor * tensor, int64_t expert_stride_bytes, cudaStream_t stream) {
++    const char * q122_r1_dbg = std::getenv("Q122_R1");
++    if (q122_r1_dbg && std::strcmp(q122_r1_dbg, "1") == 0 && tensor && std::strstr(tensor->name, "blk.3.") != nullptr) {
++        static int q122_cache_diag = 0;
++        if (q122_cache_diag < 16) {
++            ++q122_cache_diag;
++            std::fprintf(stderr,
++                "Q122_R1_CACHE_GET name=%s ne=[%lld,%lld,%lld,%lld] nb2=%zu stride=%lld host=%d\n",
++                tensor->name,
++                (long long) tensor->ne[0], (long long) tensor->ne[1],
++                (long long) tensor->ne[2], (long long) tensor->ne[3],
++                (size_t) tensor->nb[2], (long long) expert_stride_bytes,
++                tensor->buffer ? (ggml_backend_buffer_is_host(tensor->buffer) ? 1 : 0) : -1);
++            std::fflush(stderr);
++        }
++    }
+     if (!tensor || tensor->ne[2] <= 0 || tensor->ne[2] > MAX_EXPERTS || expert_stride_bytes <= 0) {
+         return nullptr;
+     }
+@@ -180,6 +239,17 @@ const void * const * ggml_cuda_hotexpert_cache_get(
+ 
+     std::lock_guard<std::mutex> lock(state.mutex);
+     initialize(state);
++    if (q122_r1_dbg && std::strcmp(q122_r1_dbg, "1") == 0) {
++        static int q122_state_diag = 0;
++        if (q122_state_diag < 12) {
++            ++q122_state_diag;
++            std::fprintf(stderr,
++                "Q122_R1_CACHE_STATE initialized=%d enabled=%d slots=%d budget_mib=%zu allocated_mib=%zu profile=%s entries=%zu\n",
++                state.initialized ? 1 : 0, state.enabled ? 1 : 0, state.slots,
++                state.budget >> 20, state.allocated >> 20, state.profile_path.c_str(), state.entries.size());
++            std::fflush(stderr);
++        }
++    }
+     if (!state.enabled) {
+         return nullptr;
+     }
+@@ -190,13 +260,25 @@ const void * const * ggml_cuda_hotexpert_cache_get(
+     }
+ 
+     const int layer = parse_layer(tensor->name);
++    if (q122_r1_dbg && std::strcmp(q122_r1_dbg, "1") == 0 && q122_r1_layer_enabled(layer)) {
++        std::fprintf(stderr, "Q122_R1_CACHE_LAYER layer=%d rank_count=%zu top0=%d top1=%d\n",
++            layer, state.ranked_experts[layer].size(),
++            state.ranked_experts[layer].empty() ? -1 : state.ranked_experts[layer][0],
++            state.ranked_experts[layer].size() < 2 ? -1 : state.ranked_experts[layer][1]);
++        std::fflush(stderr);
++    }
++    if (q122_r1_active() && !q122_r1_layer_enabled(layer)) {
++        return nullptr;
++    }
+     if (layer < 0 || state.ranked_experts[layer].empty()) {
+         return nullptr;
+     }
+     const int n_experts = int(tensor->ne[2]);
+     const int slots = std::min({state.slots, n_experts, int(state.ranked_experts[layer].size())});
+     const size_t slice_bytes = size_t(expert_stride_bytes);
+-    const size_t cache_bytes = size_t(slots) * slice_bytes;
++    const bool resident_only = q122_r1_resident_only(layer);
++    const size_t resident_bytes = size_t(slots) * slice_bytes;
++    const size_t cache_bytes = resident_bytes;
+     if (cache_bytes > state.budget - std::min(state.allocated, state.budget)) {
+         GGML_LOG_WARN("HotExpert cache: budget exhausted before %s (%zu MiB requested, %zu MiB used)\n",
+                       tensor->name, cache_bytes >> 20, state.allocated >> 20);
+@@ -207,7 +289,7 @@ const void * const * ggml_cuda_hotexpert_cache_get(
+     entry->bytes = cache_bytes;
+     entry->layer = layer;
+     entry->slots = slots;
+-    cudaError_t error = cudaMalloc(&entry->device_slices, cache_bytes);
++    cudaError_t error = cudaMalloc(&entry->device_slices, resident_bytes);
+     if (error != cudaSuccess) {
+         GGML_LOG_WARN("HotExpert cache: device allocation failed for %s: %s\n",
+                       tensor->name, cudaGetErrorString(error));
+@@ -223,9 +305,14 @@ const void * const * ggml_cuda_hotexpert_cache_get(
+         return nullptr;
+     }
+ 
+-    std::vector<const void *> table(n_experts);
+-    for (int expert = 0; expert < n_experts; ++expert) {
+-        table[expert] = static_cast<const char *>(tensor->data) + size_t(expert) * slice_bytes;
++    // R1 resident-only mode uses nullptr as a miss sentinel. The MMVQ kernel
++    // recognizes it and writes a zero result without executing the dot-product.
++    // Normal static-cache mode preserves the original host-pointer fallback.
++    std::vector<const void *> table(n_experts, nullptr);
++    if (!resident_only) {
++        for (int expert = 0; expert < n_experts; ++expert) {
++            table[expert] = static_cast<const char *>(tensor->data) + size_t(expert) * slice_bytes;
++        }
+     }
+     for (int slot = 0; slot < slots; ++slot) {
+         const int expert = state.ranked_experts[layer][slot];
+@@ -246,8 +333,8 @@ const void * const * ggml_cuda_hotexpert_cache_get(
+     CUDA_CHECK(cudaMemcpyAsync(entry->device_table, table.data(), table.size() * sizeof(void *), cudaMemcpyHostToDevice, stream));
+ 
+     state.allocated += cache_bytes;
+-    GGML_LOG_INFO("HotExpert cache: cached %s layer=%d slots=%d slice=%zu KiB total=%zu MiB\n",
+-                  tensor->name, layer, slots, slice_bytes >> 10, state.allocated >> 20);
++    GGML_LOG_INFO("HotExpert cache: cached %s layer=%d slots=%d slice=%zu KiB total=%zu MiB resident_only=%d\n",
++                  tensor->name, layer, slots, slice_bytes >> 10, state.allocated >> 20, resident_only ? 1 : 0);
+     const void * const * result = entry->device_table;
+     state.entries.emplace(tensor->data, std::move(entry));
+     return result;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 76359a3a3..2657cdbfe 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -550,6 +550,11 @@ static __global__ void mul_mat_vec_q(
+         }
+     }
+ 
++    // In Q122 R1 resident-only cache tables, nullptr means this expert is a
++    // CPU miss. Keep the GPU output slot zero and skip all weight dot-products.
++    // Transit may have supplied a real pointer above, in which case it is not a miss.
++    const bool hotexpert_null_miss = ids && fusion.expert_ptrs && vx_expert == nullptr;
++
+     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+     const uint32_t sample_y    = sample_dst;
+ 
+@@ -587,6 +592,7 @@ static __global__ void mul_mat_vec_q(
+         const void * p = v2_transit->ptrs[v2_transit_bank][fusion.hotexpert_v2_gate_kind][v2_transit_slot];
+         if (p) vgate_expert = p;
+     }
++    const bool hotexpert_gate_null_miss = ids && fusion.gate_expert_ptrs && vgate_expert == nullptr;
+ 
+ 
+     [[maybe_unused]] float x_biases[ncols_dst]    = { 0.0f };
+@@ -655,10 +661,12 @@ static __global__ void mul_mat_vec_q(
+         for (int j = 0; j < ncols_dst; ++j) {
+ #pragma unroll
+             for (int i = 0; i < rows_per_cuda_block; ++i) {
+-                tmp[j][i] += vec_dot_q_cuda(
+-                    vx_expert, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                if (!hotexpert_null_miss) {
++                    tmp[j][i] += vec_dot_q_cuda(
++                        vx_expert, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                }
+                 if constexpr (has_fusion) {
+-                    if (use_gate) {
++                    if (use_gate && !hotexpert_gate_null_miss) {
+                         tmp_gate[j][i] += vec_dot_q_cuda(
+                             vgate_expert, &y[j*stride_col_y + kby], gate_kbx_offset + i*stride_row_x + kbx, kqs);
+                     }
+@@ -714,7 +722,9 @@ static __global__ void mul_mat_vec_q(
+ 
+             if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+                 float result = tmp[j][i];
+-                if constexpr (has_fusion) {
++                if (hotexpert_null_miss) {
++                    result = 0.0f;
++                } else if constexpr (has_fusion) {
+                     if constexpr (type == GGML_TYPE_NVFP4) {
+                         result *= x_scales;
+                     }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index d92d3c461..c444cf981 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1903,8 +1903,120 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * selected_experts_in) const {
+     const int64_t n_embd   = cur->ne[0];
+     const int64_t n_tokens = cur->ne[1];
++    {
++        static int q122_r1_raw_probe = 0;
++        const char * q122_raw_env = std::getenv("Q122_R1");
++        if (q122_raw_env && std::strcmp(q122_raw_env, "1") == 0 && q122_r1_raw_probe < 12) {
++            ++q122_r1_raw_probe;
++            std::fprintf(stderr, "Q122_R1_RAW build_moe_ffn il=%d ubatch=%u nt=%lld warmup=%d ne_used=%lld\n",
++                         il, ubatch.n_tokens, (long long) n_tokens, cparams.warmup ? 1 : 0, (long long) n_expert_used);
++            std::fflush(stderr);
++        }
++    }
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+ 
++    // Qwen3.5-122B R1 prototype: one cold layer is split into two independent
++    // MMID branches. CPU computes cache misses (R0 hook skips resident experts),
++    // GPU computes resident experts only (HotExpert cache points misses at a
++    // device zero slice), then the branches are added before the normal FFN ops.
++    // Decode-only by design; warmup/prefill remain on the original path.
++    static const bool q122_r1_env = [] {
++        const char * v = std::getenv("Q122_R1");
++        return v && std::strcmp(v, "1") == 0;
++    }();
++    static const std::array<bool, 256> q122_r1_layers = [] {
++        std::array<bool, 256> out{};
++        const char * list = std::getenv("Q122_R1_SPLIT_LAYERS");
++        if (list && *list) {
++            const char * p = list;
++            while (*p) {
++                while (*p == ' ' || *p == ',') ++p;
++                if (!*p) break;
++                char * end = nullptr;
++                long layer = std::strtol(p, &end, 10);
++                if (end == p) break;
++                if (layer >= 0 && layer < 256) out[size_t(layer)] = true;
++                p = end;
++            }
++        } else {
++            const char * v = std::getenv("Q122_R1_SPLIT_LAYER");
++            int layer = (v && *v) ? std::atoi(v) : 3;
++            if (layer >= 0 && layer < 256) out[size_t(layer)] = true;
++        }
++        return out;
++    }();
++    if (q122_r1_env) {
++        static int q122_r1_probe_logs = 0;
++        if (q122_r1_probe_logs < 24) {
++            ++q122_r1_probe_logs;
++            LLAMA_LOG_INFO("Q122 R1 probe: layer=%d selected=%d ubatch_tokens=%u tensor_tokens=%lld warmup=%d n_expert_used=%lld model_n_expert_used=%lld loras=%zu\n",
++                           il, (il >= 0 && il < 256 && q122_r1_layers[size_t(il)]) ? 1 : 0,
++                           ubatch.n_tokens, (long long) n_tokens, cparams.warmup ? 1 : 0,
++                           (long long) n_expert_used, (long long) hparams.n_expert_used,
++                           loras ? loras->size() : 0);
++        }
++    }
++    const bool q122_r1_here = q122_r1_env && il >= 0 && il < 256 && q122_r1_layers[size_t(il)] &&
++        ubatch.n_tokens == 1 && !cparams.warmup;
++
++    ggml_backend_t q122_r1_gpu = nullptr;
++    if (q122_r1_here) {
++        const int n_backends = ggml_backend_sched_get_n_backends(sched);
++        for (int bi = 0; bi < n_backends; ++bi) {
++            ggml_backend_t candidate = ggml_backend_sched_get_backend(sched, bi);
++            if (candidate != backend_cpu) {
++                q122_r1_gpu = candidate;
++                break;
++            }
++        }
++        if (!q122_r1_gpu) {
++            LLAMA_LOG_WARN("Q122 R1: no non-CPU backend found for layer %d, disabling split\n", il);
++        }
++    }
++
++    auto q122_r1_mm_id = [&](ggml_tensor * w, ggml_tensor * x, ggml_tensor * ids, ggml_tensor * w_s, const char * tag) -> ggml_tensor * {
++        if (!q122_r1_here || !q122_r1_gpu || (loras && !loras->empty())) {
++            return build_lora_mm_id(w, x, ids, w_s);
++        }
++        // Order matters: CUDA/ROCm graph_compute is asynchronous while the CPU
++        // backend graph_compute blocks. Put the GPU branch first in the graph so
++        // the scheduler launches it before entering the synchronous CPU branch.
++        ggml_tensor * gpu = ggml_mul_mat_id(ctx0, w, x, ids);
++        ggml_tensor * cpu = ggml_mul_mat_id(ctx0, w, x, ids);
++        ggml_format_name(gpu, "q122_r1_gpu_%s_l%d", tag, il);
++        ggml_format_name(cpu, "q122_r1_cpu_%s_l%d", tag, il);
++        ggml_backend_sched_set_tensor_backend(sched, gpu, q122_r1_gpu);
++        ggml_backend_sched_set_tensor_backend(sched, cpu, backend_cpu);
++        ggml_tensor * sum = ggml_add(ctx0, gpu, cpu);
++        ggml_format_name(sum, "q122_r1_sum_%s_l%d", tag, il);
++        ggml_backend_sched_set_tensor_backend(sched, sum, backend_cpu);
++
++        // Qwen3.5 MoE uses per-expert scale tensors. Apply the scale once to the
++        // reconstructed CPU+GPU result; this is algebraically identical to
++        // scaling each branch separately and avoids duplicating scale work.
++        if (w_s) {
++            const int64_t n_exp = w_s->ne[0];
++            const int64_t n_tok = x->ne[2];
++            ggml_tensor * scale = ggml_reshape_3d(ctx0, w_s, 1, n_exp, 1);
++            scale = ggml_repeat_4d(ctx0, scale, 1, n_exp, n_tok, 1);
++            scale = ggml_get_rows(ctx0, scale, ids);
++            sum = ggml_mul(ctx0, sum, scale);
++            ggml_format_name(sum, "q122_r1_scaled_%s_l%d", tag, il);
++            ggml_backend_sched_set_tensor_backend(sched, sum, backend_cpu);
++        }
++        return sum;
++    };
++
++    if (q122_r1_here && q122_r1_gpu) {
++        static std::array<bool, 256> logged{};
++        if (!logged[size_t(il)]) {
++            logged[size_t(il)] = true;
++            std::fprintf(stderr, "Q122_R1_SPLIT enabled layer=%d cpu=%s gpu=%s decode-only\n",
++                         il, ggml_backend_name(backend_cpu), ggml_backend_name(q122_r1_gpu));
++            std::fflush(stderr);
++        }
++    }
++
+     ggml_tensor * logits = nullptr;
+ 
+     if (probs_in == nullptr) {
+@@ -2060,7 +2172,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     if (gate_up_exps) {
+         // merged gate_up path: one mul_mat_id, then split into gate and up views
+-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
++        ggml_tensor * gate_up = q122_r1_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, "gate_up"); // [n_ff*2, n_expert_used, n_tokens]
+         cb(gate_up, "ffn_moe_gate_up", il);
+ 
+         if (up_exps_s) {
+@@ -2079,7 +2191,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(up, "ffn_moe_up", il);
+     } else {
+         // separate gate and up path
+-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
++        up = q122_r1_mm_id(up_exps, cur, selected_experts, up_exps_s, "up"); // [n_ff, n_expert_used, n_tokens]
+         cb(up, "ffn_moe_up", il);
+ 
+         if (up_exps_s) {
+@@ -2092,7 +2204,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+ 
+         if (gate_exps) {
+-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
++            cur = q122_r1_mm_id(gate_exps, cur, selected_experts, gate_exps_s, "gate"); // [n_ff, n_expert_used, n_tokens]
+             cb(cur, "ffn_moe_gate", il);
+         } else {
+             cur = up;
+@@ -2181,7 +2293,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             GGML_ABORT("fatal error");
+     }
+ 
+-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
++    experts = q122_r1_mm_id(down_exps, cur, selected_experts, down_exps_s, "down"); // [n_embd, n_expert_used, n_tokens]
+     cb(experts, "ffn_moe_down", il);
+ 
+     if (down_exps_s) {

@@ -1,0 +1,89 @@
+# 当前生产关键配置摘录（2026-08-23）
+# 实际生产文件：
+# /home/victor/ai_share/llama_box/config/config-rocm714.yaml
+
+ornith-1.5-35b:256k:
+  ttl: 1200
+  env:
+    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp-b10235-hotexpert-v2/build-hip-rocm714/bin:/opt/rocm/lib"
+    - "HIP_VISIBLE_DEVICES=0"
+    - "HOTSEAT_TENSOR_LAYERS=0"
+    - "HOTSEAT_EXPERT_SLOTS=95"
+    - "HOTSEAT_LAYER_PLAN_FILE=/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat/ornith15-hotseat-native-4.json"
+    - "HOTSEAT_RUNTIME_MODE=dynamic-hybrid"
+    - "HOTSEAT_RUNTIME_PROFILE=/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat/ornith15-hotexpert-profile-native-12288.json"
+    - "HOTSEAT_RUNTIME_INIT_FULL_LAYERS=0,1,2,3"
+    - "HOTSEAT_FULL_LAYER_COUNT=4"
+    - "HOTSEAT_FULL_SHADOW=1"
+    - "HOTSEAT_AUTO_RESERVE_ARENA=1"
+    - "HOTSEAT_ARENA_APPLY_PROFILE=/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat/arena-text-baseline.json"
+    - "HOTSEAT_AUTO_PROFILE_DIR=/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat/arena-text"
+    - "HOTSEAT_RUNTIME_LOG=/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat/swaps.jsonl"
+    - "HOTSEAT_V2_PREFETCH=1"
+    - "HOTSEAT_V2_TRANSIT=1"
+    - "HOTSEAT_V2_TRANSIT_SLOTS=2"
+    - "HOTSEAT_V2_PERSISTENT_TRANSIT=1"
+    - "HOTSEAT_V2_PREDICTOR_FILE=/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat-v2/ornith15-self-repeat-predictor-v2.json"
+    - "HOTSEAT_V2_PREDICTOR_MIN_PPM=300000"
+  cmd: >
+    /app/share/llama_box/src/llama.cpp-b10235-hotexpert-v2/build-hip-rocm714/bin/llama-server
+    --host 127.0.0.1 --port ${PORT} --jinja
+    -m /app/share/llm/Ornith-1.5-35B-A3B-GGUF/Ornith-1.5-35B-A3B-abliterated.Q8_0.gguf
+    -c 262144 -ngl 999 -t 6 -tb 16 -np 1 -b 2048 -ub 1024
+    --cache-ram 0 --no-mmap --mlock
+    --repeat-penalty 1.03 --repeat-last-n 256
+    --dry-multiplier 0.8 --dry-base 1.75 --dry-allowed-length 4 --dry-penalty-last-n 2048
+
+ornith-1.5-35b-vision:256k:
+  ttl: 1200
+  env:
+    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp-b10235-hotexpert-v2/build-hip-rocm714/bin:/opt/rocm/lib"
+    - "HIP_VISIBLE_DEVICES=0"
+    - "HOTSEAT_TENSOR_LAYERS=0"
+    - "HOTSEAT_EXPERT_SLOTS=90"
+    - "HOTSEAT_LAYER_PLAN_FILE=/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat/ornith15-hotseat-native-4.json"
+    - "HOTSEAT_RUNTIME_MODE=dynamic-hybrid"
+    - "HOTSEAT_RUNTIME_PROFILE=/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat/ornith15-hotexpert-profile-native-12288.json"
+    - "HOTSEAT_RUNTIME_INIT_FULL_LAYERS=0,1,2,3"
+    - "HOTSEAT_FULL_LAYER_COUNT=4"
+    - "HOTSEAT_FULL_SHADOW=1"
+    - "HOTSEAT_AUTO_RESERVE_ARENA=1"
+    - "HOTSEAT_ARENA_APPLY_PROFILE=/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat/arena-vision-baseline.json"
+    - "HOTSEAT_ARENA_TARGET_FREE_MB=600"
+    - "HOTSEAT_ARENA_JITTER_MB=64"
+    - "HOTSEAT_AUTO_PROFILE_DIR=/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat/arena-vision"
+    - "HOTSEAT_RUNTIME_LOG=/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat/swaps-vision.jsonl"
+    - "HOTSEAT_V2_PREFETCH=1"
+    - "HOTSEAT_V2_TRANSIT=1"
+    - "HOTSEAT_V2_TRANSIT_SLOTS=2"
+    - "HOTSEAT_V2_PERSISTENT_TRANSIT=1"
+    - "HOTSEAT_V2_PREDICTOR_FILE=/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat-v2/ornith15-vision-self-repeat-predictor-v2.json"
+    - "HOTSEAT_V2_PREDICTOR_MIN_PPM=300000"
+  cmd: >
+    /app/share/llama_box/src/llama.cpp-b10235-hotexpert-v2/build-hip-rocm714/bin/llama-server
+    --host 127.0.0.1 --port ${PORT} --jinja
+    -m /app/share/llm/Ornith-1.5-35B-A3B-GGUF/Ornith-1.5-35B-A3B-abliterated.Q8_0.gguf
+    --mmproj /app/share/llm/Ornith-1.5-35B-A3B-GGUF/mmproj-Ornith-1.5-35B-BF16.gguf
+    -c 262144 -ngl 999 -t 6 -tb 16 -np 1 -b 2048 -ub 1024
+    --cache-ram 0 --no-mmap --mlock
+
+qwen3.5-122b:256k:
+  ttl: 1200
+  env:
+    - "LD_LIBRARY_PATH=/app/share/llama_box/src/llama.cpp-b10235-hotexpert-v2-q122/build-hip-rocm714/bin:/opt/rocm/lib"
+    - "HIP_VISIBLE_DEVICES=0"
+    - "HOTSEAT_TENSOR_LAYERS=3"
+    - "Q122_R1=1"
+    - "Q122_R1_SPLIT_LAYERS=3,21,22,23,24,25,26,27,28,29,30,34,35,37,43,44"
+    - "Q122_R0_SKIP_SLOTS=21"
+    - "Q122_R1_RESIDENT_ONLY=1"
+    - "HOTEXPERT_CACHE=1"
+    - "HOTEXPERT_CACHE_SLOTS=21"
+    - "HOTEXPERT_CACHE_VRAM_BUDGET_MB=3400"
+    - "HOTEXPERT_CACHE_PROFILE=/app/share/llm/Qwen3.5-122B-A10B-abliterated-Q8_0-GGUF/hotseat-v2/q122-static-cache-profile.json"
+  cmd: >
+    /app/share/llama_box/src/llama.cpp-b10235-hotexpert-v2-q122/build-hip-rocm714/bin/llama-server
+    --host 127.0.0.1 --port ${PORT} --jinja
+    -m /app/share/llm/Qwen3.5-122B-A10B-abliterated-Q8_0-GGUF/Qwen3.5-122B-A10B-abliterated.Q8_0.gguf
+    -c 262144 -ngl 999 -t 4 -np 1 -b 2048 -ub 2048
+    --cache-ram 0 --no-mmap --mlock

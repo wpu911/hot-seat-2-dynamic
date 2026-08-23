@@ -1,0 +1,1354 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index f2e4a7b34..259beb0d1 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1540,6 +1540,20 @@ struct ggml_cuda_mm_fusion_args_device {
+     const void * gate_scale = nullptr;
+     const void * const * expert_ptrs = nullptr;
+     const void * const * gate_expert_ptrs = nullptr;
++    // HotSeat V2 Stage-0 profiler. These remain null/zero outside explicitly
++    // profiled single-token MoE MMVQ launches.
++    uint64_t * hotexpert_v2_current_token = nullptr;
++    void * hotexpert_v2_records = nullptr;
++    const uint32_t * hotexpert_v2_resident_bits = nullptr;
++    uint32_t hotexpert_v2_capacity = 0;
++    uint32_t hotexpert_v2_n_layers = 0;
++    uint32_t hotexpert_v2_layer = 0;
++    uint32_t hotexpert_v2_kind = 0;
++    // Stage 2 predictive transit metadata. Fixed device addresses are safe
++    // with HIP graph capture; the metadata contents change per token.
++    const void * hotexpert_v2_transit_meta = nullptr;
++    uint32_t hotexpert_v2_gate_kind = UINT32_MAX;
++    uint32_t hotexpert_v2_transit_slots = 0;
+     ggml_glu_op glu_op;
+ };
+ 
+diff --git a/ggml/src/ggml-cuda/hotexpert-runtime.cu b/ggml/src/ggml-cuda/hotexpert-runtime.cu
+index 99204f556..f40435e5d 100644
+--- a/ggml/src/ggml-cuda/hotexpert-runtime.cu
++++ b/ggml/src/ggml-cuda/hotexpert-runtime.cu
+@@ -20,6 +20,7 @@
+ #include <glob.h>
+ #include <sys/stat.h>
+ #include <fstream>
++#include <filesystem>
+ #include <mutex>
+ #include <numeric>
+ #include <set>
+@@ -209,6 +210,21 @@ struct hotseat_profile {
+     std::vector<std::vector<double>> expert_gain;
+ };
+ 
++// HotSeat V2 Stage 1: tiny mapped-host routing history written directly by
++// the GPU record kernel.  A token callback can consume the previous token's
++// Top-K IDs without a D2H copy or compute-stream synchronization.
++struct v2_route_record {
++    uint64_t generation = 0;
++    uint64_t token = UINT64_MAX;
++    int32_t expert_ids[GGML_HOTEXPERT_V2_PROFILE_TOP_K] = {};
++    // Mapped host memory on HIP is reliable for ordinary per-thread stores,
++    // but atomics to it are not a portable coherence primitive.  Give each
++    // routing lane its own word and avoid cross-thread atomics entirely.
++    uint32_t resident_flags[GGML_HOTEXPERT_V2_PROFILE_TOP_K] = {};
++    uint32_t transit_flags[GGML_HOTEXPERT_V2_PROFILE_TOP_K] = {};
++    uint32_t route_count = 0;
++};
++
+ struct rt_state {
+     runtime_mode mode = MODE_STATIC;
+     bool enabled = false;
+@@ -242,6 +258,71 @@ struct rt_state {
+     uint64_t * d_prefill_rows = nullptr;  // [MAX_LAYERS]
+     uint32_t * d_resident     = nullptr;  // [MAX_LAYERS * MAX_EXPERTS/32]
+ 
++    // HotSeat V2 Stage 0: finite device ring, copied only when the runtime is
++    // shut down. This keeps JSON serialization and D2H traffic off the decode
++    // hot path while preserving per-token/per-layer records for benchmarks.
++    bool v2_profile_enabled = false;
++    uint64_t v2_profile_capacity = 2048;
++    std::string v2_profile_dir;
++    ggml_hotexpert_v2_layer_record * d_v2_records = nullptr;
++    uint64_t * d_v2_token_count = nullptr;
++    uint64_t * d_v2_current_token = nullptr;
++    uint64_t v2_clock_rate_khz = 0;
++    uint64_t v2_profile_started_us = 0;
++    std::vector<uint64_t> v2_token_times_us;
++
++    // Stage 1 routing history.  h_v2_routes is CPU-visible pinned memory and
++    // d_v2_routes is its device alias (on ROCm they may be numerically equal).
++    bool v2_prefetch_enabled = false;
++    uint64_t v2_route_capacity = 64;
++    v2_route_record * h_v2_routes = nullptr;
++    v2_route_record * d_v2_routes = nullptr;
++    uint64_t * h_v2_route_latest = nullptr;
++    uint64_t * d_v2_route_latest = nullptr;
++    std::atomic<uint64_t> v2_route_complete_tokens{0};
++    std::atomic<uint64_t> v2_route_missing_layers{0};
++
++    // Stage 2: fixed-address double-buffered predictive transit storage.
++    // The per-layer metadata is device-resident and graph-safe; only its
++    // contents change.  A dedicated stream copies the predicted misses.
++    bool v2_transit_enabled = false;
++    int v2_transit_slots = 2;
++    void * d_v2_transit_base = nullptr;
++    size_t v2_transit_bytes = 0;
++    ggml_hotexpert_v2_transit_meta * d_v2_transit_meta = nullptr;
++    std::vector<ggml_hotexpert_v2_transit_meta> h_v2_transit_meta;
++    cudaStream_t v2_prefetch_stream = nullptr;
++    std::atomic<uint64_t> v2_prefetch_tokens{0};
++    std::atomic<uint64_t> v2_prefetch_experts{0};
++    std::atomic<uint64_t> v2_prefetch_bytes{0};
++    std::atomic<uint64_t> v2_routed_experts{0};
++    std::atomic<uint64_t> v2_resident_hits{0};
++    std::atomic<uint64_t> v2_transit_hits{0};
++
++    // Stage 2.4 persistent Transit: treat the two physical banks as a tiny
++    // two-entry per-layer cache instead of overwriting one bank every token.
++    // A predicted expert already present in either bank is carried forward
++    // with metadata only, eliminating the H2D copy.
++    bool v2_persistent_transit = false;
++    std::array<std::array<std::array<uint64_t, GGML_HOTEXPERT_V2_TRANSIT_MAX_SLOTS>,
++        GGML_HOTEXPERT_V2_TRANSIT_BANKS>, MAX_LAYERS> v2_persistent_last_used{};
++    std::atomic<uint64_t> v2_persistent_reused{0};
++
++    // Stage 2.1 confidence-gated self-repeat predictor.  Scores are stored in
++    // parts-per-million so the decode worker never needs floating-point JSON
++    // parsing or model-specific code.
++    bool v2_predictor_loaded = false;
++    uint32_t v2_predictor_min_ppm = 0;
++    std::string v2_predictor_path;
++    std::array<std::array<uint32_t, MAX_EXPERTS>, MAX_LAYERS> v2_repeat_ppm{};
++    std::atomic<uint64_t> v2_predictor_skipped{0};
++
++    std::thread v2_prefetch_worker;
++    std::mutex v2_prefetch_mutex;
++    std::condition_variable v2_prefetch_cv;
++    bool v2_prefetch_stopping = false;
++    std::atomic<uint64_t> v2_latest_token{UINT64_MAX};
++
+     // cross-thread counters
+     std::atomic<uint64_t> decode_tokens{0};
+     std::atomic<uint64_t> prefill_tokens{0};
+@@ -523,6 +604,50 @@ static bool load_profile(rt_state & s, const std::string & path, const std::stri
+     return true;
+ }
+ 
++static bool load_v2_predictor(rt_state & s, const std::string & path) {
++    std::ifstream in(path, std::ios::binary);
++    if (!in) {
++        GGML_LOG_WARN("HotSeat V2 predictor: cannot open %s\n", path.c_str());
++        return false;
++    }
++    const std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++    size_t pos = 0;
++    int loaded = 0;
++    while ((pos = json.find("\"layer\"", pos)) != std::string::npos) {
++        size_t colon = json.find(':', pos);
++        if (colon == std::string::npos) break;
++        pos = colon + 1;
++        uint64_t layer_value = 0;
++        if (!parse_unsigned(json, pos, layer_value) || layer_value >= MAX_LAYERS) continue;
++        const size_t next_layer = json.find("\"layer\"", pos);
++        size_t scores = json.find("\"scores_ppm\"", pos);
++        if (scores == std::string::npos || (next_layer != std::string::npos && scores > next_layer)) continue;
++        scores = json.find('[', scores);
++        if (scores == std::string::npos) continue;
++        ++scores;
++        int e = 0;
++        for (; e < MAX_EXPERTS && scores < json.size() && json[scores] != ']'; ++e) {
++            uint64_t value = 0;
++            if (!parse_unsigned(json, scores, value)) break;
++            s.v2_repeat_ppm[layer_value][e] = uint32_t(std::min<uint64_t>(value, 1000000));
++            while (scores < json.size() && std::isspace(static_cast<unsigned char>(json[scores]))) ++scores;
++            if (scores < json.size() && json[scores] == ',') ++scores;
++        }
++        if (e > 0) ++loaded;
++        pos = scores;
++    }
++    if (!loaded) {
++        GGML_LOG_WARN("HotSeat V2 predictor: no scores_ppm found in %s\n", path.c_str());
++        return false;
++    }
++    s.v2_predictor_loaded = true;
++    s.v2_predictor_path = path;
++    std::fprintf(stderr, "HotSeat V2 predictor: loaded=%d min_ppm=%u path=%s\n",
++        loaded, s.v2_predictor_min_ppm, path.c_str());
++    std::fflush(stderr);
++    return true;
++}
++
+ static std::set<int> parse_layer_plan(const std::string & path) {
+     std::set<int> plan;
+     std::ifstream in(path);
+@@ -604,6 +729,17 @@ __global__ void runtime_record_kernel(
+         uint64_t * miss_rows,
+         uint64_t * prefill_rows,
+         const uint32_t * resident_bits,
++        ggml_hotexpert_v2_layer_record * v2_records,
++        v2_route_record * v2_routes,
++        uint64_t * v2_route_latest,
++        const ggml_hotexpert_v2_transit_meta * v2_transit_meta,
++        int v2_transit_slots,
++        uint64_t * v2_token_count,
++        uint64_t * v2_current_token,
++        uint64_t v2_capacity,
++        uint64_t v2_route_capacity,
++        uint64_t generation,
++        int n_layers,
+         int layer,
+         int n_experts,
+         int top_k,
+@@ -613,6 +749,52 @@ __global__ void runtime_record_kernel(
+     if (expert_slot >= top_k) {
+         return;
+     }
++    ggml_hotexpert_v2_layer_record * v2_record = nullptr;
++    v2_route_record * v2_route = nullptr;
++    const bool v2_decode = !record_prefill && n_rows == 1 &&
++        (v2_records || v2_routes) && v2_token_count && v2_current_token &&
++        layer >= 0 && layer < n_layers;
++    uint64_t v2_token = 0;
++    if (v2_decode) {
++        if (layer == 0 && expert_slot == 0) {
++            const uint64_t token = atomicAdd((unsigned long long *) v2_token_count, 1ULL);
++            *v2_current_token = token;
++        }
++        __syncthreads();
++        v2_token = *v2_current_token;
++        if (v2_records && v2_capacity > 0) {
++            v2_record = &v2_records[(v2_token % v2_capacity) * size_t(n_layers) + size_t(layer)];
++        }
++        if (v2_routes && v2_route_capacity > 0) {
++            v2_route = &v2_routes[(v2_token % v2_route_capacity) * size_t(n_layers) + size_t(layer)];
++        }
++        if (expert_slot == 0) {
++            if (v2_record) {
++                v2_record->generation = generation;
++                v2_record->resident_mask = 0;
++                v2_record->route_count = uint32_t(min(top_k, GGML_HOTEXPERT_V2_PROFILE_TOP_K));
++                for (int i = 0; i < GGML_HOTEXPERT_V2_PROFILE_TOP_K; ++i) {
++                    v2_record->expert_ids[i] = -1;
++                }
++                for (int i = 0; i < GGML_HOTEXPERT_V2_PROFILE_KINDS; ++i) {
++                    v2_record->mmvq_cycles[i] = 0;
++                    v2_record->host_cycles[i] = 0;
++                    v2_record->resident_cycles[i] = 0;
++                }
++            }
++            if (v2_route) {
++                v2_route->generation = generation;
++                v2_route->token = v2_token;
++                v2_route->route_count = uint32_t(min(top_k, GGML_HOTEXPERT_V2_PROFILE_TOP_K));
++                for (int i = 0; i < GGML_HOTEXPERT_V2_PROFILE_TOP_K; ++i) {
++                    v2_route->expert_ids[i] = -1;
++                    v2_route->resident_flags[i] = 0;
++                    v2_route->transit_flags[i] = 0;
++                }
++            }
++        }
++        __syncthreads();
++    }
+     if (record_prefill && expert_slot == 0) {
+         atomicAdd((unsigned long long *) &prefill_rows[layer], (unsigned long long) n_rows);
+     }
+@@ -629,11 +811,79 @@ __global__ void runtime_record_kernel(
+             atomicAdd((unsigned long long *) &prefill_hits[size_t(layer) * MAX_EXPERTS + id], 1ULL);
+         } else {
+             const uint32_t word = resident_bits[size_t(layer) * (MAX_EXPERTS / 32) + (id >> 5)];
+-            if (!(word & (1u << (id & 31)))) {
++            const bool resident = (word & (1u << (id & 31))) != 0;
++            if (!resident) {
+                 atomicAdd((unsigned long long *) &miss_rows[layer], 1ULL);
+             }
++            if (expert_slot < GGML_HOTEXPERT_V2_PROFILE_TOP_K) {
++                if (v2_record) {
++                    v2_record->expert_ids[expert_slot] = id;
++                    if (resident) {
++                        atomicOr((unsigned int *) &v2_record->resident_mask, 1u << expert_slot);
++                    }
++                }
++                if (v2_route) {
++                    v2_route->expert_ids[expert_slot] = id;
++                    v2_route->resident_flags[expert_slot] = resident ? 1u : 0u;
++                    uint32_t transit_hit = 0;
++                    if (!resident && v2_transit_meta && v2_transit_slots > 0) {
++                        const auto & meta = v2_transit_meta[layer];
++                        const int slots = min(v2_transit_slots, GGML_HOTEXPERT_V2_TRANSIT_MAX_SLOTS);
++                        // Search both physical banks. In legacy double-buffer
++                        // mode only one bank has ready_token==v2_token, so this
++                        // is behavior-preserving; persistent mode can carry
++                        // both cached experts forward for the same token.
++                        for (int bank = 0; bank < GGML_HOTEXPERT_V2_TRANSIT_BANKS && !transit_hit; ++bank) {
++                            if (meta.ready_token[bank] != v2_token) continue;
++                            for (int slot = 0; slot < slots; ++slot) {
++                                if (meta.expert_ids[bank][slot] == id) {
++                                    transit_hit = 1u;
++                                    break;
++                                }
++                            }
++                        }
++                    }
++                    v2_route->transit_flags[expert_slot] = transit_hit;
++                }
++            }
+         }
+     }
++    if (v2_route) {
++        __syncthreads();
++        if (expert_slot == 0) {
++            // Publish all per-layer route writes before exposing the latest
++            // token number to the host callback.  The callback can therefore
++            // consume the mapped ring without a D2H synchronization.
++            __threadfence_system();
++            if (v2_route_latest && layer == n_layers - 1) {
++                *v2_route_latest = v2_token;
++                __threadfence_system();
++            }
++        }
++    }
++}
++
++// Stage-2 publish runs on the dedicated prefetch stream after all H2D copies
++// for one layer.  Stream ordering guarantees the weight copies are complete;
++// ready_token is written last, so decode either sees a complete generation or
++// keeps using the original resident/host pointer table.
++__global__ void v2_publish_transit_kernel(
++        ggml_hotexpert_v2_transit_meta * meta,
++        int bank,
++        uint64_t target_token,
++        int32_t e0,
++        int32_t e1,
++        int32_t e2,
++        int32_t e3) {
++    if (blockIdx.x != 0 || threadIdx.x != 0 || !meta || bank < 0 || bank >= GGML_HOTEXPERT_V2_TRANSIT_BANKS) {
++        return;
++    }
++    meta->expert_ids[bank][0] = e0;
++    meta->expert_ids[bank][1] = e1;
++    meta->expert_ids[bank][2] = e2;
++    meta->expert_ids[bank][3] = e3;
++    __threadfence();
++    atomicExch((unsigned long long *) &meta->ready_token[bank], (unsigned long long) target_token);
+ }
+ 
+ static int adaptive_eval_tokens(rt_state & s);
+@@ -641,8 +891,21 @@ static int adaptive_eval_tokens(rt_state & s);
+ static void token_callback(void * user_data) {
+     auto * state = static_cast<rt_state *>(user_data);
+     const uint64_t tokens = ++state->decode_tokens;
++    if (state->v2_prefetch_enabled && state->h_v2_routes && state->h_v2_route_latest) {
++        const uint64_t route_token = *state->h_v2_route_latest;
++        if (route_token != UINT64_MAX) {
++            state->v2_latest_token.store(route_token, std::memory_order_release);
++            state->v2_prefetch_cv.notify_one();
++        }
++    }
+     // stage I: rolling decode-TPS telemetry (1 s windows)
+     const uint64_t now_us = uint64_t(ggml_time_us());
++    if (state->v2_profile_enabled && !state->v2_token_times_us.empty()) {
++        if (state->v2_profile_started_us == 0) {
++            state->v2_profile_started_us = now_us;
++        }
++        state->v2_token_times_us[size_t((tokens - 1) % state->v2_profile_capacity)] = now_us;
++    }
+     const uint64_t win_start = state->window_start_us.load(std::memory_order_relaxed);
+     const uint64_t win_tokens = state->window_decode_tokens.load(std::memory_order_relaxed);
+     if (win_start == 0) {
+@@ -757,12 +1020,135 @@ static void allocate_banks(rt_state & s, int n_full_layers, int n_top64_layers)
+     CUDA_CHECK(cudaMemset(s.d_prefill_rows, 0, size_t(MAX_LAYERS) * sizeof(uint64_t)));
+     CUDA_CHECK(cudaMemset(s.d_resident, 0,     size_t(MAX_LAYERS) * (MAX_EXPERTS / 32) * sizeof(uint32_t)));
+ 
++    if (s.v2_profile_enabled || s.v2_prefetch_enabled) {
++        CUDA_CHECK(cudaMalloc((void **) &s.d_v2_token_count, sizeof(uint64_t)));
++        CUDA_CHECK(cudaMalloc((void **) &s.d_v2_current_token, sizeof(uint64_t)));
++        CUDA_CHECK(cudaMemset(s.d_v2_token_count, 0, sizeof(uint64_t)));
++        CUDA_CHECK(cudaMemset(s.d_v2_current_token, 0, sizeof(uint64_t)));
++    }
++    if (s.v2_profile_enabled) {
++        const size_t record_count = size_t(s.v2_profile_capacity) * size_t(s.n_layers);
++        CUDA_CHECK(cudaMalloc((void **) &s.d_v2_records,
++            record_count * sizeof(ggml_hotexpert_v2_layer_record)));
++        CUDA_CHECK(cudaMemset(s.d_v2_records, 0,
++            record_count * sizeof(ggml_hotexpert_v2_layer_record)));
++        s.v2_token_times_us.assign(size_t(s.v2_profile_capacity), 0);
++        cudaDeviceProp prop{};
++        CUDA_CHECK(cudaGetDeviceProperties(&prop, s.device));
++#if defined(GGML_USE_HIP)
++        int wall_clock_rate_khz = 0;
++        CUDA_CHECK(cudaDeviceGetAttribute(
++            &wall_clock_rate_khz, hipDeviceAttributeWallClockRate, s.device));
++        s.v2_clock_rate_khz = uint64_t(std::max(wall_clock_rate_khz, 1));
++#else
++        s.v2_clock_rate_khz = uint64_t(std::max(prop.clockRate, 1));
++#endif
++        std::fprintf(stderr, "HotSeat V2 profiler: device ring=%llu tokens, %.2f MiB, clock=%llu kHz\n",
++            (unsigned long long) s.v2_profile_capacity,
++            double(record_count * sizeof(ggml_hotexpert_v2_layer_record)) / double(1u << 20),
++            (unsigned long long) s.v2_clock_rate_khz);
++    }
++
++    if (s.v2_prefetch_enabled) {
++        const size_t route_count = size_t(s.v2_route_capacity) * size_t(s.n_layers);
++        const size_t route_bytes = route_count * sizeof(v2_route_record);
++#if defined(GGML_USE_HIP)
++        CUDA_CHECK(hipHostMalloc((void **) &s.h_v2_routes, route_bytes, hipHostMallocMapped | hipHostMallocPortable));
++        CUDA_CHECK(hipHostGetDevicePointer((void **) &s.d_v2_routes, s.h_v2_routes, 0));
++        CUDA_CHECK(hipHostMalloc((void **) &s.h_v2_route_latest, sizeof(uint64_t), hipHostMallocMapped | hipHostMallocPortable));
++        CUDA_CHECK(hipHostGetDevicePointer((void **) &s.d_v2_route_latest, s.h_v2_route_latest, 0));
++#else
++        CUDA_CHECK(cudaHostAlloc((void **) &s.h_v2_routes, route_bytes, cudaHostAllocMapped | cudaHostAllocPortable));
++        CUDA_CHECK(cudaHostGetDevicePointer((void **) &s.d_v2_routes, s.h_v2_routes, 0));
++        CUDA_CHECK(cudaHostAlloc((void **) &s.h_v2_route_latest, sizeof(uint64_t), cudaHostAllocMapped | cudaHostAllocPortable));
++        CUDA_CHECK(cudaHostGetDevicePointer((void **) &s.d_v2_route_latest, s.h_v2_route_latest, 0));
++#endif
++        *s.h_v2_route_latest = UINT64_MAX;
++        std::memset(s.h_v2_routes, 0, route_bytes);
++        for (size_t i = 0; i < route_count; ++i) s.h_v2_routes[i].token = UINT64_MAX;
++        std::fprintf(stderr, "HotSeat V2 Stage1: mapped routing ring=%llu tokens, %.2f KiB host=%p device=%p\n",
++            (unsigned long long) s.v2_route_capacity, double(route_bytes) / 1024.0,
++            (void *) s.h_v2_routes, (void *) s.d_v2_routes);
++    }
++
+     CUDA_CHECK(cudaStreamCreateWithFlags(&s.side_stream, cudaStreamNonBlocking));
+     CUDA_CHECK(hipEventCreate(&s.copy_start));
+     CUDA_CHECK(hipEventCreate(&s.copy_end));
+     CUDA_CHECK(cudaEventCreateWithFlags(&s.ready_event, cudaEventDisableTiming));
+ }
+ 
++static void allocate_v2_transit(rt_state & s) {
++    if (!s.v2_prefetch_enabled || !s.v2_transit_enabled || s.n_layers <= 0) {
++        return;
++    }
++
++    size_t total = 0;
++    for (int layer = 0; layer < s.n_layers; ++layer) {
++        const layer_t & L = s.layers[layer];
++        if (!L.registered || L.full || L.arena_full) continue;
++        for (int bank = 0; bank < GGML_HOTEXPERT_V2_TRANSIT_BANKS; ++bank) {
++            for (int kind = 0; kind < MAX_TENSORS; ++kind) {
++                const tensor_slot & t = L.tensors[kind];
++                if (!t.host_ptr || t.stride <= 0) continue;
++                total = GGML_PAD(total, 4096);
++                total += size_t(s.v2_transit_slots) * size_t(t.stride);
++            }
++        }
++    }
++    if (total == 0) {
++        GGML_LOG_WARN("HotSeat V2 Stage2: no transit storage required; disabling prefetch\n");
++        s.v2_prefetch_enabled = false;
++        return;
++    }
++
++    CUDA_CHECK(cudaMalloc(&s.d_v2_transit_base, total));
++    s.v2_transit_bytes = total;
++    s.h_v2_transit_meta.assign(size_t(s.n_layers), ggml_hotexpert_v2_transit_meta{});
++    for (auto & meta : s.h_v2_transit_meta) {
++        for (int bank = 0; bank < GGML_HOTEXPERT_V2_TRANSIT_BANKS; ++bank) {
++            meta.ready_token[bank] = UINT64_MAX;
++            for (int slot = 0; slot < GGML_HOTEXPERT_V2_TRANSIT_MAX_SLOTS; ++slot) {
++                meta.expert_ids[bank][slot] = -1;
++            }
++        }
++    }
++    for (auto & layer_use : s.v2_persistent_last_used) {
++        for (auto & bank_use : layer_use) {
++            bank_use.fill(0);
++        }
++    }
++
++    size_t offset = 0;
++    for (int layer = 0; layer < s.n_layers; ++layer) {
++        const layer_t & L = s.layers[layer];
++        if (!L.registered || L.full || L.arena_full) continue;
++        auto & meta = s.h_v2_transit_meta[size_t(layer)];
++        for (int bank = 0; bank < GGML_HOTEXPERT_V2_TRANSIT_BANKS; ++bank) {
++            for (int kind = 0; kind < MAX_TENSORS; ++kind) {
++                const tensor_slot & t = L.tensors[kind];
++                if (!t.host_ptr || t.stride <= 0) continue;
++                offset = GGML_PAD(offset, 4096);
++                char * base = static_cast<char *>(s.d_v2_transit_base) + offset;
++                for (int slot = 0; slot < s.v2_transit_slots; ++slot) {
++                    meta.ptrs[bank][kind][slot] = base + size_t(slot) * size_t(t.stride);
++                }
++                offset += size_t(s.v2_transit_slots) * size_t(t.stride);
++            }
++        }
++    }
++
++    CUDA_CHECK(cudaMalloc((void **) &s.d_v2_transit_meta,
++        size_t(s.n_layers) * sizeof(ggml_hotexpert_v2_transit_meta)));
++    CUDA_CHECK(cudaMemcpy(s.d_v2_transit_meta, s.h_v2_transit_meta.data(),
++        size_t(s.n_layers) * sizeof(ggml_hotexpert_v2_transit_meta), cudaMemcpyHostToDevice));
++    CUDA_CHECK(cudaStreamCreateWithFlags(&s.v2_prefetch_stream, cudaStreamNonBlocking));
++
++    size_t free_now = 0, total_vram = 0;
++    hipMemGetInfo(&free_now, &total_vram);
++    std::fprintf(stderr, "HotSeat V2 Stage2: transit=%zu MiB slots/layer/bank=%d banks=%d free_after=%zu MiB\n",
++        total >> 20, s.v2_transit_slots, GGML_HOTEXPERT_V2_TRANSIT_BANKS, free_now >> 20);
++}
++
+ // pointer for a resident expert of a non-full layer
+ static const void * resident_ptr(rt_state & s, const layer_t & L, int kind, int expert, size_t stride) {
+     if (L.in_shadow[expert]) {
+@@ -1113,6 +1499,8 @@ static void restore_runtime_snapshot_arena(rt_state & s) {
+ static void shutdown_runtime(rt_state & s);
+ static void worker_loop(rt_state * s);
+ 
++static void v2_prefetch_worker_loop(rt_state * s);
++
+ static bool initialize_runtime(rt_state & s) {
+     int max_layer = -1;
+     int n_experts = 0;
+@@ -1288,6 +1676,10 @@ static bool initialize_runtime(rt_state & s) {
+         s.pool_slots = s.top_k;
+     }
+     allocate_banks(s, int(full_layers.size()), int(top64_layers.size()));
++    std::fprintf(stderr, "HotSeat V2 Stage2 flags: prefetch=%d transit=%d slots=%d predictor=%d min_ppm=%u persistent=%d\n",
++        int(s.v2_prefetch_enabled), int(s.v2_transit_enabled), s.v2_transit_slots,
++        int(s.v2_predictor_loaded), s.v2_predictor_min_ppm, int(s.v2_persistent_transit));
++    allocate_v2_transit(s);
+ 
+     // initial staging (H2D, one-time)
+     for (int layer : full_layers) {
+@@ -1419,6 +1811,9 @@ static bool initialize_runtime(rt_state & s) {
+     }
+ 
+     s.worker = std::thread(worker_loop, &s);
++    if (s.v2_prefetch_enabled) {
++        s.v2_prefetch_worker = std::thread(v2_prefetch_worker_loop, &s);
++    }
+     std::atexit([] { shutdown_runtime(g_state); });
+ 
+     std::fprintf(stderr,
+@@ -2711,6 +3106,221 @@ static void run_evaluation(rt_state & s) {
+     s.eval_requested.store(false, std::memory_order_release);
+ }
+ 
++static void v2_prefetch_worker_loop(rt_state * s) {
++    uint64_t next_token = 0;
++    CUDA_CHECK(cudaSetDevice(s->device));
++    for (;;) {
++        uint64_t latest = UINT64_MAX;
++        {
++            std::unique_lock<std::mutex> lock(s->v2_prefetch_mutex);
++            s->v2_prefetch_cv.wait(lock, [&] {
++                const uint64_t l = s->v2_latest_token.load(std::memory_order_acquire);
++                return s->v2_prefetch_stopping || (l != UINT64_MAX && l >= next_token);
++            });
++            if (s->v2_prefetch_stopping) {
++                return;
++            }
++            latest = s->v2_latest_token.load(std::memory_order_acquire);
++        }
++        if (!s->h_v2_routes || latest == UINT64_MAX || s->n_layers <= 0) {
++            continue;
++        }
++        while (next_token <= latest) {
++            const uint64_t token = next_token++;
++            uint64_t valid = 0;
++            const size_t base = size_t(token % s->v2_route_capacity) * size_t(s->n_layers);
++            for (int layer = 0; layer < s->n_layers; ++layer) {
++                const v2_route_record & r = s->h_v2_routes[base + size_t(layer)];
++                if (r.token == token && r.route_count > 0) {
++                    ++valid;
++                }
++            }
++            if (valid == uint64_t(s->n_layers)) {
++                uint64_t routed = 0, resident = 0, transit = 0;
++                for (int layer = 0; layer < s->n_layers; ++layer) {
++                    const v2_route_record & r = s->h_v2_routes[base + size_t(layer)];
++                    routed += r.route_count;
++                    for (uint32_t i = 0; i < r.route_count && i < GGML_HOTEXPERT_V2_PROFILE_TOP_K; ++i) {
++                        resident += r.resident_flags[i] ? 1u : 0u;
++                        transit += r.transit_flags[i] ? 1u : 0u;
++                    }
++                }
++                s->v2_routed_experts.fetch_add(routed, std::memory_order_relaxed);
++                s->v2_resident_hits.fetch_add(resident, std::memory_order_relaxed);
++                s->v2_transit_hits.fetch_add(transit, std::memory_order_relaxed);
++                s->v2_route_complete_tokens.fetch_add(1, std::memory_order_relaxed);
++            } else {
++                s->v2_route_missing_layers.fetch_add(uint64_t(s->n_layers) - valid, std::memory_order_relaxed);
++                continue;
++            }
++
++            if (!s->d_v2_transit_meta || !s->d_v2_transit_base || !s->v2_prefetch_stream) {
++                continue;
++            }
++
++            const uint64_t target = token + 1;
++            const int bank = int(target % GGML_HOTEXPERT_V2_TRANSIT_BANKS);
++            uint64_t token_experts = 0;
++            uint64_t token_bytes = 0;
++
++            for (int layer = 0; layer < s->n_layers; ++layer) {
++                const layer_t & L = s->layers[layer];
++                if (!L.registered || L.full || L.arena_full) continue;
++                const v2_route_record & r = s->h_v2_routes[base + size_t(layer)];
++
++                int32_t selected[GGML_HOTEXPERT_V2_TRANSIT_MAX_SLOTS] = { -1, -1, -1, -1 };
++                int n_selected = 0;
++                const int routes = std::min<int>(r.route_count, GGML_HOTEXPERT_V2_PROFILE_TOP_K);
++                if (s->v2_predictor_loaded) {
++                    std::array<std::pair<uint32_t, int>, GGML_HOTEXPERT_V2_PROFILE_TOP_K> cand{};
++                    int n_cand = 0;
++                    for (int i = 0; i < routes; ++i) {
++                        const int e = r.expert_ids[i];
++                        if (e < 0 || e >= s->n_experts || r.resident_flags[i]) continue;
++                        bool duplicate = false;
++                        for (int j = 0; j < n_cand; ++j) duplicate |= cand[j].second == e;
++                        if (!duplicate) cand[n_cand++] = { s->v2_repeat_ppm[layer][e], e };
++                    }
++                    std::sort(cand.begin(), cand.begin() + n_cand,
++                        [](const auto & a, const auto & b) { return a.first > b.first; });
++                    int below_threshold = 0;
++                    for (int i = 0; i < n_cand && n_selected < s->v2_transit_slots; ++i) {
++                        if (cand[i].first < s->v2_predictor_min_ppm) {
++                            below_threshold = n_cand - i;
++                            break;
++                        }
++                        selected[n_selected++] = cand[i].second;
++                    }
++                    if (below_threshold > 0) {
++                        s->v2_predictor_skipped.fetch_add(uint64_t(below_threshold), std::memory_order_relaxed);
++                    }
++                } else {
++                    for (int i = 0; i < routes && n_selected < s->v2_transit_slots; ++i) {
++                        const int e = r.expert_ids[i];
++                        if (e < 0 || e >= s->n_experts) continue;
++                        if (r.resident_flags[i]) continue;
++                        bool duplicate = false;
++                        for (int j = 0; j < n_selected; ++j) duplicate |= selected[j] == e;
++                        if (!duplicate) selected[n_selected++] = e;
++                    }
++                }
++                if (s->v2_persistent_transit) {
++                    // The token callback is queued after the final-layer router,
++                    // before that layer's MMVQ. Earlier layers are already done
++                    // and their Transit banks can be safely reused. Keep the
++                    // last MoE layer on the original host/resident path to avoid
++                    // overwriting a bank that its current MMVQ may still read.
++                    if (layer == s->n_layers - 1) continue;
++                    auto & meta = s->h_v2_transit_meta[size_t(layer)];
++
++                    // Refresh LRU timestamps from the route that just finished.
++                    for (int pb = 0; pb < GGML_HOTEXPERT_V2_TRANSIT_BANKS; ++pb) {
++                        for (int ps = 0; ps < s->v2_transit_slots; ++ps) {
++                            const int ce = meta.expert_ids[pb][ps];
++                            if (ce < 0) continue;
++                            for (int ri = 0; ri < routes; ++ri) {
++                                if (r.expert_ids[ri] == ce) {
++                                    s->v2_persistent_last_used[size_t(layer)][pb][ps] = token;
++                                    break;
++                                }
++                            }
++                        }
++                    }
++
++                    for (int si = 0; si < n_selected; ++si) {
++                        const int e = selected[si];
++                        int hit_bank = -1, hit_slot = -1;
++                        for (int pb = 0; pb < GGML_HOTEXPERT_V2_TRANSIT_BANKS && hit_bank < 0; ++pb) {
++                            for (int ps = 0; ps < s->v2_transit_slots; ++ps) {
++                                if (meta.expert_ids[pb][ps] == e) {
++                                    hit_bank = pb; hit_slot = ps; break;
++                                }
++                            }
++                        }
++                        if (hit_bank >= 0) {
++                            s->v2_persistent_last_used[size_t(layer)][hit_bank][hit_slot] = token;
++                            s->v2_persistent_reused.fetch_add(1, std::memory_order_relaxed);
++                            continue;
++                        }
++
++                        int victim_bank = -1, victim_slot = -1;
++                        uint64_t oldest = UINT64_MAX;
++                        for (int pb = 0; pb < GGML_HOTEXPERT_V2_TRANSIT_BANKS; ++pb) {
++                            for (int ps = 0; ps < s->v2_transit_slots; ++ps) {
++                                if (meta.expert_ids[pb][ps] < 0) {
++                                    victim_bank = pb; victim_slot = ps; oldest = 0; break;
++                                }
++                                const uint64_t lu = s->v2_persistent_last_used[size_t(layer)][pb][ps];
++                                if (victim_bank < 0 || lu < oldest) {
++                                    oldest = lu; victim_bank = pb; victim_slot = ps;
++                                }
++                            }
++                            if (oldest == 0) break;
++                        }
++                        if (victim_bank < 0) continue;
++                        for (int kind = 0; kind < MAX_TENSORS; ++kind) {
++                            const tensor_slot & t = L.tensors[kind];
++                            const void * dst = meta.ptrs[victim_bank][kind][victim_slot];
++                            if (!t.host_ptr || t.stride <= 0 || !dst) continue;
++                            CUDA_CHECK(cudaMemcpyAsync(
++                                const_cast<void *>(dst),
++                                static_cast<const char *>(t.host_ptr) + size_t(e) * size_t(t.stride),
++                                size_t(t.stride), cudaMemcpyHostToDevice, s->v2_prefetch_stream));
++                            token_bytes += uint64_t(t.stride);
++                        }
++                        meta.expert_ids[victim_bank][victim_slot] = e;
++                        s->v2_persistent_last_used[size_t(layer)][victim_bank][victim_slot] = token;
++                        token_experts++;
++                    }
++
++                    // Carry both physical cache banks forward to the target
++                    // token. For a replaced bank this publish is ordered after
++                    // its H2D copy on the same side stream.
++                    for (int pb = 0; pb < GGML_HOTEXPERT_V2_TRANSIT_BANKS; ++pb) {
++                        const ggml_cuda_kernel_launch_params publish_params(
++                            dim3(1, 1, 1), dim3(1, 1, 1), 0, s->v2_prefetch_stream);
++                        ggml_cuda_kernel_launch(v2_publish_transit_kernel, publish_params,
++                            s->d_v2_transit_meta + layer, pb, target,
++                            meta.expert_ids[pb][0], meta.expert_ids[pb][1],
++                            meta.expert_ids[pb][2], meta.expert_ids[pb][3]);
++                    }
++                    continue;
++                }
++
++                if (n_selected == 0) continue;
++
++                const auto & meta = s->h_v2_transit_meta[size_t(layer)];
++                for (int slot = 0; slot < n_selected; ++slot) {
++                    const int e = selected[slot];
++                    for (int kind = 0; kind < MAX_TENSORS; ++kind) {
++                        const tensor_slot & t = L.tensors[kind];
++                        const void * dst = meta.ptrs[bank][kind][slot];
++                        if (!t.host_ptr || t.stride <= 0 || !dst) continue;
++                        CUDA_CHECK(cudaMemcpyAsync(
++                            const_cast<void *>(dst),
++                            static_cast<const char *>(t.host_ptr) + size_t(e) * size_t(t.stride),
++                            size_t(t.stride), cudaMemcpyHostToDevice, s->v2_prefetch_stream));
++                        token_bytes += uint64_t(t.stride);
++                    }
++                    token_experts++;
++                }
++
++                const ggml_cuda_kernel_launch_params publish_params(
++                    dim3(1, 1, 1), dim3(1, 1, 1), 0, s->v2_prefetch_stream);
++                ggml_cuda_kernel_launch(v2_publish_transit_kernel, publish_params,
++                    s->d_v2_transit_meta + layer, bank, target,
++                    selected[0], selected[1], selected[2], selected[3]);
++            }
++
++            if (token_experts > 0) {
++                s->v2_prefetch_tokens.fetch_add(1, std::memory_order_relaxed);
++                s->v2_prefetch_experts.fetch_add(token_experts, std::memory_order_relaxed);
++                s->v2_prefetch_bytes.fetch_add(token_bytes, std::memory_order_relaxed);
++            }
++        }
++    }
++}
++
+ static void worker_loop(rt_state * s) {
+     for (;;) {
+         {
+@@ -2730,6 +3340,240 @@ static void worker_loop(rt_state * s) {
+ // shutdown
+ // ---------------------------------------------------------------------------
+ 
++static double v2_cycles_to_us(const rt_state & s, uint64_t cycles) {
++    return s.v2_clock_rate_khz > 0
++        ? double(cycles) * 1000.0 / double(s.v2_clock_rate_khz)
++        : 0.0;
++}
++
++static uint64_t v2_expert_bytes(const rt_state & s, int layer) {
++    uint64_t bytes = 0;
++    for (int kind = 0; kind < MAX_TENSORS; ++kind) {
++        const tensor_slot & t = s.layers[layer].tensors[kind];
++        if (t.host_ptr && t.stride > 0) {
++            bytes += uint64_t(t.stride);
++        }
++    }
++    return bytes;
++}
++
++static void dump_v2_profile(rt_state & s) {
++    if (!s.v2_profile_enabled || !s.d_v2_records || !s.d_v2_token_count ||
++        s.v2_profile_capacity == 0 || s.n_layers <= 0) {
++        return;
++    }
++
++    uint64_t total_tokens = 0;
++    CUDA_CHECK(cudaMemcpy(&total_tokens, s.d_v2_token_count, sizeof(total_tokens), cudaMemcpyDeviceToHost));
++    const uint64_t kept_tokens = std::min(total_tokens, s.v2_profile_capacity);
++    const uint64_t first_token = total_tokens - kept_tokens;
++    const size_t record_count = size_t(s.v2_profile_capacity) * size_t(s.n_layers);
++    std::vector<ggml_hotexpert_v2_layer_record> records(record_count);
++    CUDA_CHECK(cudaMemcpy(records.data(), s.d_v2_records,
++        record_count * sizeof(ggml_hotexpert_v2_layer_record), cudaMemcpyDeviceToHost));
++
++    size_t free_now = 0;
++    size_t total_vram = 0;
++    if (hipMemGetInfo(&free_now, &total_vram) != hipSuccess) {
++        free_now = 0;
++        total_vram = 0;
++    }
++    const uint64_t low_water = s.arena_min_free_seen
++        ? s.arena_min_free_seen
++        : uint64_t(free_now);
++
++    std::error_code ec;
++    std::filesystem::create_directories(s.v2_profile_dir, ec);
++    if (ec) {
++        GGML_LOG_ERROR("HotSeat V2 profiler: cannot create %s: %s\n",
++            s.v2_profile_dir.c_str(), ec.message().c_str());
++        return;
++    }
++    const std::string token_path = s.v2_profile_dir + "/v2-token-profile.jsonl";
++    const std::string layer_path = s.v2_profile_dir + "/v2-layer-profile.jsonl";
++    FILE * token_file = std::fopen(token_path.c_str(), "w");
++    FILE * layer_file = std::fopen(layer_path.c_str(), "w");
++    if (!token_file || !layer_file) {
++        GGML_LOG_ERROR("HotSeat V2 profiler: cannot open JSONL output in %s\n",
++            s.v2_profile_dir.c_str());
++        if (token_file) std::fclose(token_file);
++        if (layer_file) std::fclose(layer_file);
++        return;
++    }
++
++#if defined(GGML_USE_HIP)
++    const char * timing_method = "wall_clock64_representative_block_estimate";
++#else
++    const char * timing_method = "clock64_representative_block_estimate";
++#endif
++    std::fprintf(token_file,
++        "{\"record_type\":\"run_meta\",\"profile_version\":1,"
++        "\"timing_method\":\"%s\","
++        "\"total_decode_tokens\":%llu,\"kept_decode_tokens\":%llu,"
++        "\"dropped_decode_tokens\":%llu,\"capacity\":%llu,"
++        "\"layers\":%d,\"experts\":%d,\"top_k\":%d,"
++        "\"prompt_tokens\":%llu,\"prompt_tps\":null,"
++        "\"timing_clock_rate_khz\":%llu,\"gpu_vram_total_bytes\":%zu,"
++        "\"gpu_vram_used_bytes_at_shutdown\":%zu,"
++        "\"physical_vram_free_low_water_bytes\":%llu}\n",
++        timing_method,
++        (unsigned long long) total_tokens,
++        (unsigned long long) kept_tokens,
++        (unsigned long long) (total_tokens - kept_tokens),
++        (unsigned long long) s.v2_profile_capacity,
++        s.n_layers, s.n_experts, GGML_HOTEXPERT_V2_PROFILE_TOP_K,
++        (unsigned long long) s.prefill_tokens.load(std::memory_order_acquire),
++        (unsigned long long) s.v2_clock_rate_khz,
++        total_vram, total_vram > free_now ? total_vram - free_now : 0,
++        (unsigned long long) low_water);
++
++    uint64_t run_host_bytes = 0;
++    uint64_t run_resident_bytes = 0;
++    uint64_t run_host_misses = 0;
++    uint64_t run_resident_hits = 0;
++    uint64_t first_time_us = 0;
++    uint64_t last_time_us = 0;
++
++    for (uint64_t token = first_token; token < total_tokens; ++token) {
++        const size_t ring = size_t(token % s.v2_profile_capacity);
++        const uint64_t timestamp_us = ring < s.v2_token_times_us.size()
++            ? s.v2_token_times_us[ring]
++            : 0;
++        if (timestamp_us && !first_time_us) first_time_us = timestamp_us;
++        if (timestamp_us) last_time_us = timestamp_us;
++        uint64_t token_host_bytes = 0;
++        uint64_t token_resident_bytes = 0;
++        uint64_t token_host_misses = 0;
++        uint64_t token_resident_hits = 0;
++        double token_mmvq_us = 0.0;
++        double token_host_us = 0.0;
++        double token_resident_us = 0.0;
++        uint64_t generation = 0;
++
++        for (int layer = 0; layer < s.n_layers; ++layer) {
++            const auto & rec = records[ring * size_t(s.n_layers) + size_t(layer)];
++            generation = std::max(generation, rec.generation);
++            const uint32_t routes = std::min<uint32_t>(
++                rec.route_count, GGML_HOTEXPERT_V2_PROFILE_TOP_K);
++            const uint32_t valid_mask = routes >= 32 ? 0xffffffffu : ((1u << routes) - 1u);
++            const uint32_t resident_hits = uint32_t(__builtin_popcount(rec.resident_mask & valid_mask));
++            const uint32_t host_misses = routes - resident_hits;
++            const uint64_t expert_bytes = v2_expert_bytes(s, layer);
++            const uint64_t resident_bytes = uint64_t(resident_hits) * expert_bytes;
++            const uint64_t host_bytes = uint64_t(host_misses) * expert_bytes;
++            uint64_t mmvq_cycles = 0;
++            uint64_t host_cycles = 0;
++            uint64_t resident_cycles = 0;
++            for (int kind = 0; kind < GGML_HOTEXPERT_V2_PROFILE_KINDS; ++kind) {
++                mmvq_cycles += rec.mmvq_cycles[kind];
++                host_cycles += rec.host_cycles[kind];
++                resident_cycles += rec.resident_cycles[kind];
++            }
++            const double mmvq_us = v2_cycles_to_us(s, mmvq_cycles);
++            const double host_us = v2_cycles_to_us(s, host_cycles);
++            const double resident_us = v2_cycles_to_us(s, resident_cycles);
++
++            std::fprintf(layer_file,
++                "{\"record_type\":\"layer\",\"generation\":%llu,"
++                "\"token\":%llu,\"layer\":%d,\"expert_ids\":[",
++                (unsigned long long) rec.generation,
++                (unsigned long long) token, layer);
++            for (uint32_t i = 0; i < routes; ++i) {
++                std::fprintf(layer_file, "%s%d", i ? "," : "", rec.expert_ids[i]);
++            }
++            std::fprintf(layer_file,
++                "],\"resident_hits\":%u,\"host_misses\":%u,"
++                "\"estimated_resident_bytes\":%llu,\"estimated_host_bytes\":%llu,"
++                "\"mmvq_kernel_elapsed_us\":%.3f,"
++                "\"hostexpert_path_elapsed_us\":%.3f,"
++                "\"resident_path_elapsed_us\":%.3f,"
++                "\"timing_estimate\":true}\n",
++                resident_hits, host_misses,
++                (unsigned long long) resident_bytes,
++                (unsigned long long) host_bytes,
++                mmvq_us, host_us, resident_us);
++
++            token_host_bytes += host_bytes;
++            token_resident_bytes += resident_bytes;
++            token_host_misses += host_misses;
++            token_resident_hits += resident_hits;
++            token_mmvq_us += mmvq_us;
++            token_host_us += host_us;
++            token_resident_us += resident_us;
++        }
++
++        double decode_tps = 0.0;
++        if (token > first_token && timestamp_us && !s.v2_token_times_us.empty()) {
++            const uint64_t prev_time = s.v2_token_times_us[
++                size_t((token - 1) % s.v2_profile_capacity)];
++            if (prev_time && timestamp_us > prev_time) {
++                decode_tps = 1e6 / double(timestamp_us - prev_time);
++            }
++        }
++        const double pcie_gbps = decode_tps > 0.0
++            ? double(token_host_bytes) * decode_tps / 1e9
++            : 0.0;
++        std::fprintf(token_file,
++            "{\"record_type\":\"token\",\"generation\":%llu,"
++            "\"token\":%llu,\"timestamp_us\":%llu,"
++            "\"resident_hits\":%llu,\"host_misses\":%llu,"
++            "\"estimated_resident_bytes\":%llu,\"estimated_host_bytes\":%llu,"
++            "\"estimated_pcie_bytes\":%llu,\"estimated_pcie_gbps\":%.6f,"
++            "\"mmvq_kernel_elapsed_us\":%.3f,"
++            "\"hostexpert_path_elapsed_us\":%.3f,"
++            "\"resident_path_elapsed_us\":%.3f,\"decode_tps\":%.6f}\n",
++            (unsigned long long) generation,
++            (unsigned long long) token,
++            (unsigned long long) timestamp_us,
++            (unsigned long long) token_resident_hits,
++            (unsigned long long) token_host_misses,
++            (unsigned long long) token_resident_bytes,
++            (unsigned long long) token_host_bytes,
++            (unsigned long long) token_host_bytes,
++            pcie_gbps, token_mmvq_us, token_host_us, token_resident_us, decode_tps);
++
++        run_host_bytes += token_host_bytes;
++        run_resident_bytes += token_resident_bytes;
++        run_host_misses += token_host_misses;
++        run_resident_hits += token_resident_hits;
++    }
++
++    const double elapsed_s = last_time_us > first_time_us
++        ? double(last_time_us - first_time_us) / 1e6
++        : 0.0;
++    const double decode_tps = elapsed_s > 0.0 && kept_tokens > 1
++        ? double(kept_tokens - 1) / elapsed_s
++        : 0.0;
++    const double pcie_gbps = elapsed_s > 0.0
++        ? double(run_host_bytes) / elapsed_s / 1e9
++        : 0.0;
++    std::fprintf(token_file,
++        "{\"record_type\":\"run_summary\",\"decode_tokens\":%llu,"
++        "\"decode_tps\":%.6f,\"prompt_tokens\":%llu,\"prompt_tps\":null,"
++        "\"resident_hits\":%llu,\"host_misses\":%llu,"
++        "\"estimated_resident_bytes\":%llu,\"estimated_host_bytes\":%llu,"
++        "\"estimated_pcie_bytes_per_token\":%.3f,"
++        "\"estimated_pcie_gbps\":%.6f,"
++        "\"gpu_vram_total_bytes\":%zu,"
++        "\"gpu_vram_used_low_water_bytes\":%llu,"
++        "\"physical_vram_free_low_water_bytes\":%llu}\n",
++        (unsigned long long) kept_tokens, decode_tps,
++        (unsigned long long) s.prefill_tokens.load(std::memory_order_acquire),
++        (unsigned long long) run_resident_hits,
++        (unsigned long long) run_host_misses,
++        (unsigned long long) run_resident_bytes,
++        (unsigned long long) run_host_bytes,
++        kept_tokens ? double(run_host_bytes) / double(kept_tokens) : 0.0,
++        pcie_gbps, total_vram,
++        (unsigned long long) (total_vram > low_water ? total_vram - low_water : 0),
++        (unsigned long long) low_water);
++
++    std::fclose(layer_file);
++    std::fclose(token_file);
++    GGML_LOG_INFO("HotSeat V2 profiler: wrote %llu tokens to %s and %s\n",
++        (unsigned long long) kept_tokens, token_path.c_str(), layer_path.c_str());
++}
++
+ static void shutdown_runtime(rt_state & s) {
+     if (!s.initialized) {
+         return;
+@@ -2742,9 +3586,36 @@ static void shutdown_runtime(rt_state & s) {
+     if (s.worker.joinable()) {
+         s.worker.join();
+     }
++    if (s.v2_prefetch_worker.joinable()) {
++        {
++            std::lock_guard<std::mutex> lock(s.v2_prefetch_mutex);
++            s.v2_prefetch_stopping = true;
++        }
++        s.v2_prefetch_cv.notify_one();
++        s.v2_prefetch_worker.join();
++    }
+     save_runtime_snapshot(s);
+     CUDA_CHECK(cudaSetDevice(s.device));
+     CUDA_CHECK(cudaDeviceSynchronize());
++    if (s.v2_prefetch_enabled) {
++        const uint64_t routed = s.v2_routed_experts.load(std::memory_order_relaxed);
++        const uint64_t resident = s.v2_resident_hits.load(std::memory_order_relaxed);
++        const uint64_t transit = s.v2_transit_hits.load(std::memory_order_relaxed);
++        std::fprintf(stderr,
++            "HotSeat V2 summary: complete_tokens=%llu missing_layers=%llu prefetch_tokens=%llu experts=%llu bytes=%llu routed=%llu resident_hits=%llu transit_hits=%llu transit_hit_pct=%.2f predictor_skipped=%llu persistent_reused=%llu\n",
++            (unsigned long long) s.v2_route_complete_tokens.load(std::memory_order_relaxed),
++            (unsigned long long) s.v2_route_missing_layers.load(std::memory_order_relaxed),
++            (unsigned long long) s.v2_prefetch_tokens.load(std::memory_order_relaxed),
++            (unsigned long long) s.v2_prefetch_experts.load(std::memory_order_relaxed),
++            (unsigned long long) s.v2_prefetch_bytes.load(std::memory_order_relaxed),
++            (unsigned long long) routed,
++            (unsigned long long) resident,
++            (unsigned long long) transit,
++            routed ? 100.0 * double(transit) / double(routed) : 0.0,
++            (unsigned long long) s.v2_predictor_skipped.load(std::memory_order_relaxed),
++            (unsigned long long) s.v2_persistent_reused.load(std::memory_order_relaxed));
++    }
++    dump_v2_profile(s);
+     for (auto & bank : s.full_banks)  if (bank.base)  CUDA_CHECK(cudaFree(bank.base));
+     for (auto & bank : s.top64_banks) if (bank.base)  CUDA_CHECK(cudaFree(bank.base));
+     for (int layer = 0; layer < s.n_layers; ++layer) {
+@@ -2760,6 +3631,40 @@ static void shutdown_runtime(rt_state & s) {
+     if (s.d_miss)         CUDA_CHECK(cudaFree(s.d_miss));
+     if (s.d_prefill_rows) CUDA_CHECK(cudaFree(s.d_prefill_rows));
+     if (s.d_resident)     CUDA_CHECK(cudaFree(s.d_resident));
++    if (s.d_v2_records)       CUDA_CHECK(cudaFree(s.d_v2_records));
++    if (s.d_v2_token_count)   CUDA_CHECK(cudaFree(s.d_v2_token_count));
++    if (s.d_v2_current_token) CUDA_CHECK(cudaFree(s.d_v2_current_token));
++    if (s.v2_prefetch_stream) {
++        CUDA_CHECK(cudaStreamSynchronize(s.v2_prefetch_stream));
++        CUDA_CHECK(cudaStreamDestroy(s.v2_prefetch_stream));
++        s.v2_prefetch_stream = nullptr;
++    }
++    if (s.d_v2_transit_meta) {
++        CUDA_CHECK(cudaFree(s.d_v2_transit_meta));
++        s.d_v2_transit_meta = nullptr;
++    }
++    if (s.d_v2_transit_base) {
++        CUDA_CHECK(cudaFree(s.d_v2_transit_base));
++        s.d_v2_transit_base = nullptr;
++    }
++    if (s.h_v2_routes) {
++#if defined(GGML_USE_HIP)
++        CUDA_CHECK(hipHostFree(s.h_v2_routes));
++#else
++        CUDA_CHECK(cudaFreeHost(s.h_v2_routes));
++#endif
++        s.h_v2_routes = nullptr;
++        s.d_v2_routes = nullptr;
++    }
++    if (s.h_v2_route_latest) {
++#if defined(GGML_USE_HIP)
++        CUDA_CHECK(hipHostFree(s.h_v2_route_latest));
++#else
++        CUDA_CHECK(cudaFreeHost(s.h_v2_route_latest));
++#endif
++        s.h_v2_route_latest = nullptr;
++        s.d_v2_route_latest = nullptr;
++    }
+     s.arena.destroy();
+     if (s.side_stream)    CUDA_CHECK(cudaStreamDestroy(s.side_stream));
+     if (s.copy_start)     CUDA_CHECK(cudaEventDestroy(s.copy_start));
+@@ -2790,6 +3695,47 @@ bool ggml_cuda_hotexpert_runtime_enabled() {
+         }
+         g_state.slots = env_int("HOTSEAT_EXPERT_SLOTS", SLOTS_PER_BANK);
+         g_state.full_count = env_int("HOTSEAT_FULL_LAYER_COUNT", 10);
++        g_state.v2_profile_enabled = [] {
++            const char * v = std::getenv("HOTSEAT_V2_PROFILE");
++            return v && std::strcmp(v, "1") == 0;
++        }();
++        g_state.v2_profile_capacity = uint64_t(std::clamp(
++            env_int("HOTSEAT_V2_PROFILE_CAPACITY", 2048), 64, 65536));
++        g_state.v2_prefetch_enabled = [] {
++            const char * v = std::getenv("HOTSEAT_V2_PREFETCH");
++            return v && std::strcmp(v, "1") == 0;
++        }();
++        g_state.v2_route_capacity = uint64_t(std::clamp(
++            env_int("HOTSEAT_V2_ROUTE_CAPACITY", 64), 2, 256));
++        g_state.v2_transit_enabled = g_state.v2_prefetch_enabled && [] {
++            const char * v = std::getenv("HOTSEAT_V2_TRANSIT");
++            return !v || std::strcmp(v, "0") != 0;
++        }();
++        g_state.v2_transit_slots = std::clamp(
++            env_int("HOTSEAT_V2_TRANSIT_SLOTS", 2), 1, GGML_HOTEXPERT_V2_TRANSIT_MAX_SLOTS);
++        g_state.v2_persistent_transit = g_state.v2_transit_enabled && [] {
++            const char * v = std::getenv("HOTSEAT_V2_PERSISTENT_TRANSIT");
++            return v && std::strcmp(v, "1") == 0;
++        }();
++        g_state.v2_predictor_min_ppm = uint32_t(std::clamp(
++            env_int("HOTSEAT_V2_PREDICTOR_MIN_PPM", 1), 1, 1000000));
++        {
++            const char * predictor = std::getenv("HOTSEAT_V2_PREDICTOR_FILE");
++            if (g_state.v2_transit_enabled && predictor && *predictor) {
++                load_v2_predictor(g_state, predictor);
++            }
++        }
++        {
++            const char * dir = std::getenv("HOTSEAT_V2_PROFILE_DIR");
++            g_state.v2_profile_dir = (dir && *dir)
++                ? dir
++                : "/app/share/llm/Ornith-1.5-35B-A3B-GGUF/hotseat-v2/profile";
++        }
++        std::fprintf(stderr, "HotSeat V2 profiler: env=%s enabled=%s capacity=%llu dir=%s\n",
++            std::getenv("HOTSEAT_V2_PROFILE") ? std::getenv("HOTSEAT_V2_PROFILE") : "<unset>",
++            g_state.v2_profile_enabled ? "yes" : "no",
++            (unsigned long long) g_state.v2_profile_capacity,
++            g_state.v2_profile_dir.c_str());
+         g_state.expert_eval_tokens = env_int("HOTSEAT_EXPERT_EVAL_TOKENS", 4096);
+         g_state.expert_eval_auto = [] {
+             const char * v = std::getenv("HOTSEAT_EXPERT_EVAL_AUTO");
+@@ -2814,7 +3760,10 @@ bool ggml_cuda_hotexpert_runtime_enabled() {
+         g_state.bw_bytes_per_ns = env_double("HOTSEAT_STALL_BW_GBPS", 12.0);
+         g_state.ewma_short = env_double("HOTSEAT_RUNTIME_EWMA_SHORT", 0.25);
+         g_state.ewma_long  = env_double("HOTSEAT_RUNTIME_EWMA_LONG", 0.05);
+-        g_state.eval_at_request = true;
++        g_state.eval_at_request = [] {
++            const char * v = std::getenv("HOTSEAT_EVAL_AT_REQUEST");
++            return !v || std::strcmp(v, "0") != 0;
++        }();
+         const char * log_path = std::getenv("HOTSEAT_RUNTIME_LOG");
+         if (log_path && *log_path) {
+             g_state.log_path = log_path;
+@@ -3163,6 +4112,47 @@ const void * const * ggml_cuda_hotexpert_runtime_get_table(
+     return static_cast<const void * const *>(map->tables[layer][kind]);
+ }
+ 
++void ggml_cuda_hotexpert_runtime_profile_mmvq(
++        const ggml_tensor * tensor,
++        ggml_cuda_mm_fusion_args_device & fusion) {
++    if ((!g_state.v2_profile_enabled && !g_state.v2_prefetch_enabled) ||
++        !g_state.initialized || !tensor || !tensor->data) {
++        return;
++    }
++    int layer = -1;
++    int kind = -1;
++    if (!tensor_registry_find(tensor->data, layer, kind) || layer < 0 || layer >= g_state.n_layers ||
++        kind < 0 || kind >= GGML_HOTEXPERT_V2_PROFILE_KINDS) {
++        return;
++    }
++
++    if (g_state.v2_profile_enabled && g_state.d_v2_records && g_state.d_v2_current_token) {
++        fusion.hotexpert_v2_current_token = g_state.d_v2_current_token;
++        fusion.hotexpert_v2_records = g_state.d_v2_records;
++        fusion.hotexpert_v2_resident_bits = g_state.d_resident;
++        fusion.hotexpert_v2_capacity = uint32_t(g_state.v2_profile_capacity);
++        fusion.hotexpert_v2_n_layers = uint32_t(g_state.n_layers);
++        fusion.hotexpert_v2_layer = uint32_t(layer);
++        fusion.hotexpert_v2_kind = uint32_t(kind);
++    }
++
++    if (g_state.v2_prefetch_enabled && g_state.d_v2_current_token && g_state.d_v2_transit_meta &&
++        layer < int(g_state.h_v2_transit_meta.size())) {
++        fusion.hotexpert_v2_current_token = g_state.d_v2_current_token;
++        fusion.hotexpert_v2_transit_meta = g_state.d_v2_transit_meta + layer;
++        fusion.hotexpert_v2_kind = uint32_t(kind);
++        fusion.hotexpert_v2_transit_slots = uint32_t(g_state.v2_transit_slots);
++        fusion.hotexpert_v2_gate_kind = UINT32_MAX;
++        if (fusion.gate) {
++            int gate_layer = -1, gate_kind = -1;
++            if (tensor_registry_find(fusion.gate, gate_layer, gate_kind) && gate_layer == layer &&
++                gate_kind >= 0 && gate_kind < GGML_HOTEXPERT_V2_PROFILE_KINDS) {
++                fusion.hotexpert_v2_gate_kind = uint32_t(gate_kind);
++            }
++        }
++    }
++}
++
+ const void * ggml_cuda_hotexpert_runtime_get_full_bank(const ggml_tensor * tensor) {
+     if (!ggml_cuda_hotexpert_runtime_enabled() || !g_state.initialized || !g_state.hybrid || !tensor || !tensor->data) {
+         return nullptr;
+@@ -3212,6 +4202,12 @@ void ggml_cuda_hotexpert_runtime_record_decode(
+         (const int32_t *) ids->data,
+         g_state.d_hits, g_state.d_prefill, g_state.d_miss, g_state.d_prefill_rows,
+         g_state.d_resident,
++        g_state.d_v2_records, g_state.d_v2_routes, g_state.d_v2_route_latest,
++        g_state.d_v2_transit_meta, g_state.v2_transit_enabled ? g_state.v2_transit_slots : 0,
++        g_state.d_v2_token_count, g_state.d_v2_current_token,
++        g_state.v2_profile_capacity, g_state.v2_route_capacity,
++        g_state.current_map ? g_state.current_map->generation : 0,
++        g_state.n_layers,
+         layer, n_experts, n_expert_used, n_rows, false);
+ 
+     if (n_rows == 1 && layer == g_state.n_layers - 1) {
+@@ -3243,5 +4239,6 @@ void ggml_cuda_hotexpert_runtime_record_prefill(
+         (const int32_t *) ids->data,
+         g_state.d_hits, g_state.d_prefill, g_state.d_miss, g_state.d_prefill_rows,
+         g_state.d_resident,
++        nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, 0, 0, 0, g_state.n_layers,
+         layer, n_experts, n_expert_used, n_rows, true);
+ }
+diff --git a/ggml/src/ggml-cuda/hotexpert-runtime.cuh b/ggml/src/ggml-cuda/hotexpert-runtime.cuh
+index 6cba36bf9..be997fc06 100644
+--- a/ggml/src/ggml-cuda/hotexpert-runtime.cuh
++++ b/ggml/src/ggml-cuda/hotexpert-runtime.cuh
+@@ -4,6 +4,37 @@
+ 
+ struct ggml_tensor;
+ 
++constexpr int GGML_HOTEXPERT_V2_PROFILE_TOP_K  = 8;
++constexpr int GGML_HOTEXPERT_V2_PROFILE_KINDS  = 4;
++constexpr int GGML_HOTEXPERT_V2_PROFILE_MAX_EXPERTS = 1024;
++
++constexpr int GGML_HOTEXPERT_V2_TRANSIT_BANKS = 2;
++constexpr int GGML_HOTEXPERT_V2_TRANSIT_MAX_SLOTS = 4;
++
++// Fixed-address device metadata for Stage-2 predictive transit.  H2D copies
++// land in the preallocated ptrs[][][] regions; a publish kernel writes the
++// expert ids and only then atomically exposes ready_token.  Decode therefore
++// either sees a complete transit generation or falls back to the original
++// resident/ROCm_Host pointer table.
++struct ggml_hotexpert_v2_transit_meta {
++    uint64_t ready_token[GGML_HOTEXPERT_V2_TRANSIT_BANKS] = { UINT64_MAX, UINT64_MAX };
++    int32_t expert_ids[GGML_HOTEXPERT_V2_TRANSIT_BANKS][GGML_HOTEXPERT_V2_TRANSIT_MAX_SLOTS] = {};
++    const void * ptrs[GGML_HOTEXPERT_V2_TRANSIT_BANKS][GGML_HOTEXPERT_V2_PROFILE_KINDS][GGML_HOTEXPERT_V2_TRANSIT_MAX_SLOTS] = {};
++};
++
++// Compact per-token/per-layer ring record. Routing is written by the existing
++// 8-thread HotExpert record kernel. MMVQ contributes representative-block
++// clock samples without adding per-layer events or stream synchronization.
++struct ggml_hotexpert_v2_layer_record {
++    uint64_t generation = 0;
++    uint64_t mmvq_cycles[GGML_HOTEXPERT_V2_PROFILE_KINDS] = {};
++    uint64_t host_cycles[GGML_HOTEXPERT_V2_PROFILE_KINDS] = {};
++    uint64_t resident_cycles[GGML_HOTEXPERT_V2_PROFILE_KINDS] = {};
++    int32_t  expert_ids[GGML_HOTEXPERT_V2_PROFILE_TOP_K] = {};
++    uint32_t resident_mask = 0;
++    uint32_t route_count = 0;
++};
++
+ // ============================================================================
+ // Runtime dynamic HotSeat / Hot Expert adjustment (llama.cpp-b10235-hotexpert)
+ //
+@@ -52,6 +83,13 @@ const void * const * ggml_cuda_hotexpert_runtime_get_table(
+         const ggml_tensor * tensor,
+         cudaStream_t        stream);
+ 
++// Adds optional Stage-0 MMVQ sampling destinations to the launch arguments.
++// No fields are changed unless HOTSEAT_V2_PROFILE=1 and the tensor is a
++// registered MoE expert weight.
++void ggml_cuda_hotexpert_runtime_profile_mmvq(
++        const ggml_tensor *                  tensor,
++        ggml_cuda_mm_fusion_args_device &    fusion);
++
+ // Returns the committed full-bank region base for a tensor in dynamic-hybrid
+ // mode (used to remap the MMQ prefill / down-decode path), or nullptr.
+ const void * ggml_cuda_hotexpert_runtime_get_full_bank(const ggml_tensor * tensor);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 71cf00c5c..76359a3a3 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -521,6 +521,35 @@ static __global__ void mul_mat_vec_q(
+ 
+     const void * vx_expert = ids && fusion.expert_ptrs ? fusion.expert_ptrs[channel_x] : vx;
+ 
++    const ggml_hotexpert_v2_transit_meta * v2_transit =
++        ids && fusion.hotexpert_v2_transit_meta && fusion.hotexpert_v2_current_token
++            ? static_cast<const ggml_hotexpert_v2_transit_meta *>(fusion.hotexpert_v2_transit_meta)
++            : nullptr;
++    int v2_transit_slot = -1;
++    int v2_transit_bank = -1;
++    if (v2_transit && fusion.hotexpert_v2_transit_slots > 0 &&
++        fusion.hotexpert_v2_kind < GGML_HOTEXPERT_V2_PROFILE_KINDS) {
++        const uint64_t token = *fusion.hotexpert_v2_current_token;
++        const int slots = min(int(fusion.hotexpert_v2_transit_slots), GGML_HOTEXPERT_V2_TRANSIT_MAX_SLOTS);
++#pragma unroll
++        for (int bank = 0; bank < GGML_HOTEXPERT_V2_TRANSIT_BANKS; ++bank) {
++            if (v2_transit->ready_token[bank] != token) continue;
++#pragma unroll
++            for (int slot = 0; slot < GGML_HOTEXPERT_V2_TRANSIT_MAX_SLOTS; ++slot) {
++                if (slot < slots && v2_transit->expert_ids[bank][slot] == int32_t(channel_x)) {
++                    const void * p = v2_transit->ptrs[bank][fusion.hotexpert_v2_kind][slot];
++                    if (p) {
++                        vx_expert = p;
++                        v2_transit_slot = slot;
++                        v2_transit_bank = bank;
++                    }
++                    break;
++                }
++            }
++            if (v2_transit_bank >= 0) break;
++        }
++    }
++
+     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+     const uint32_t sample_y    = sample_dst;
+ 
+@@ -553,6 +582,11 @@ static __global__ void mul_mat_vec_q(
+     }
+ 
+     const void * vgate_expert = ids && fusion.gate_expert_ptrs ? fusion.gate_expert_ptrs[channel_x] : vgate;
++    if (v2_transit_slot >= 0 && v2_transit_bank >= 0 && v2_transit &&
++        fusion.hotexpert_v2_gate_kind < GGML_HOTEXPERT_V2_PROFILE_KINDS) {
++        const void * p = v2_transit->ptrs[v2_transit_bank][fusion.hotexpert_v2_gate_kind][v2_transit_slot];
++        if (p) vgate_expert = p;
++    }
+ 
+ 
+     [[maybe_unused]] float x_biases[ncols_dst]    = { 0.0f };
+@@ -600,6 +634,17 @@ static __global__ void mul_mat_vec_q(
+     const int gate_kbx_offset = sample_x*stride_sample_x +
+         (fusion.gate_expert_ptrs ? 0 : channel_x*stride_channel_x) + row0*stride_row_x;
+ 
++    const bool v2_sample = ids && fusion.hotexpert_v2_records &&
++        fusion.hotexpert_v2_current_token && fusion.hotexpert_v2_resident_bits &&
++        fusion.hotexpert_v2_capacity > 0 && fusion.hotexpert_v2_n_layers > 0 &&
++        fusion.hotexpert_v2_kind < GGML_HOTEXPERT_V2_PROFILE_KINDS &&
++        blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tid == 0;
++#if defined(GGML_USE_HIP)
++    const uint64_t v2_start = v2_sample ? uint64_t(wall_clock64()) : 0;
++#else
++    const uint64_t v2_start = v2_sample ? uint64_t(clock64()) : 0;
++#endif
++
+     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+ 
+@@ -701,6 +746,28 @@ static __global__ void mul_mat_vec_q(
+         }
+     }
+ 
++    if (v2_sample) {
++#if defined(GGML_USE_HIP)
++        const uint64_t elapsed = uint64_t(wall_clock64()) - v2_start;
++#else
++        const uint64_t elapsed = uint64_t(clock64()) - v2_start;
++#endif
++        const uint64_t token = *fusion.hotexpert_v2_current_token;
++        auto * records = static_cast<ggml_hotexpert_v2_layer_record *>(fusion.hotexpert_v2_records);
++        auto & record = records[(token % fusion.hotexpert_v2_capacity) *
++            size_t(fusion.hotexpert_v2_n_layers) + size_t(fusion.hotexpert_v2_layer)];
++        const uint32_t kind = fusion.hotexpert_v2_kind;
++        record.mmvq_cycles[kind] = elapsed;
++        const uint32_t word = fusion.hotexpert_v2_resident_bits[
++            size_t(fusion.hotexpert_v2_layer) *
++            (GGML_HOTEXPERT_V2_PROFILE_MAX_EXPERTS / 32) + (channel_x >> 5)];
++        if (word & (1u << (channel_x & 31))) {
++            record.resident_cycles[kind] = elapsed;
++        } else {
++            record.host_cycles[kind] = elapsed;
++        }
++    }
++
+     if constexpr (!has_fusion) {
+         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+     }
+@@ -1287,6 +1354,7 @@ void ggml_cuda_mul_mat_vec_q(
+                     fusion->gate, fusion->gate->nb[2], stream);
+             }
+         }
++        ggml_cuda_hotexpert_runtime_profile_mmvq(src0, fusion_local);
+     }
+ 
+     mul_mat_vec_q_switch_type(

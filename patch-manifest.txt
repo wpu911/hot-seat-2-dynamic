@@ -1,0 +1,73 @@
+HotSeat upgrade patch manifest
+Generated from the current production Git trees on 2026-08-23.
+
+OFFICIAL BASE
+-------------
+llama.cpp b10235
+221f0f6356efe2260023208365705ec5d5a7c8f5
+
+ORNITH / GENERAL HOTSEAT V2
+---------------------------
+worktree:
+  /home/victor/ai_share/llama_box/src/llama.cpp-b10235-hotexpert-v2
+
+branch:
+  hotseat-v2-ornith
+
+commit:
+  9263152dc558b30ed2cec6e531f54d83e50688f1
+
+tag:
+  ornith-v2-prod-20260823
+
+Full patch:
+  git -C /home/victor/ai_share/llama_box/src/llama.cpp-b10235-hotexpert-v2 \
+    diff --binary \
+    221f0f6356efe2260023208365705ec5d5a7c8f5..9263152dc558b30ed2cec6e531f54d83e50688f1 \
+    > ornith-hotseat-full-from-b10235-base.patch
+
+Known SHA256:
+  118f458d6ab050a9d376584d91c4ad907629b4d29922f766c4d42ca353fcaad5
+
+V2-only baseline:
+  816fb44ca
+
+V2-only patch:
+  git -C /home/victor/ai_share/llama_box/src/llama.cpp-b10235-hotexpert-v2 \
+    diff --binary \
+    816fb44ca..9263152dc558b30ed2cec6e531f54d83e50688f1 \
+    > ornith-hotseat-v2.patch
+
+Known SHA256:
+  94019314f3de7377547dc10e4f610dd2756a92dc9cc665dda157b85bd3d8818f
+
+QWEN3.5-122B R1
+---------------
+worktree:
+  /home/victor/ai_share/llama_box/src/llama.cpp-b10235-hotexpert-v2-q122
+
+branch:
+  hotseat-r1-q122-stable
+
+commit:
+  42da2948beedcac288274399f62f46de438d8bca
+
+tag:
+  q122-r1-stable-20260823
+
+parent V2:
+  9263152dc558b30ed2cec6e531f54d83e50688f1
+
+Q122 patch:
+  git -C /home/victor/ai_share/llama_box/src/llama.cpp-b10235-hotexpert-v2-q122 \
+    diff --binary \
+    9263152dc558b30ed2cec6e531f54d83e50688f1..42da2948beedcac288274399f62f46de438d8bca \
+    > q122-r1.patch
+
+Known SHA256:
+  93a6025c4e6bb8ad680db82251a50d4cfbe9188c6e7b03d02c38fc1d80976270
+
+IMPORTANT
+---------
+The actual patch contents are recoverable exactly from the tagged Git worktrees above.
+Do not delete those worktrees/tags before exporting patches when preparing a future migration.
