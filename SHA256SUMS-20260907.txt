@@ -1,0 +1,5 @@
+877235327992cf5b9eb28028c083553b78588614e0699dadb0afae91c0cc6e59  patches/20260907-working-delta-from-b96fdd6fc.patch
+372e0a83d0d0000478339c7b68f21fe37b60d92672304dd72fcf9e337091ae67  patches/hotseat-dynkv-largepp-tailprefetch-from-bebc9350.patch
+e1503e24a183b003b3b3b7c07059dbcc7aae9766d62f467492c643b367613fe1  config-snippets-20260907.yaml
+12dd289a2275e2c3c7d9f9f261b5801b5d6fd242d53e620d459d01fbbb7b2cd4  docs/2026-09-07-dynkv-tiny-largepp-tail-prefetch.md
+bdff84240f8e0824a7cd21a97c15bccbe83f195091174a4754d105a7c5f718dc  patch-manifest-20260907.txt

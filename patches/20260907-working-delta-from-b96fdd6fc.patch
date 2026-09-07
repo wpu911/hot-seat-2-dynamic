@@ -1,0 +1,1326 @@
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 7e44d8eed..5b86cd0c1 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -36,6 +36,19 @@ GGML_BACKEND_API bool ggml_backend_cuda_vmm_ensure_tensor_rows(struct ggml_tenso
+ GGML_BACKEND_API bool ggml_backend_cuda_vmm_is_buffer(ggml_backend_buffer_t buffer);
+ // Reconcile Q122 elastic expert borrowing before growable KV maps more VRAM.
+ GGML_BACKEND_API bool ggml_backend_cuda_q122_dynborrow_prepare(uint32_t rows, uint32_t logical_rows);
++GGML_BACKEND_API bool ggml_backend_cuda_q122_dynborrow_reserve_bytes(size_t bytes);
++// Temporarily retire/restore elastic HotExpert slices around a large prompt prefill.
++// This gives the multi-token PP graph several GiB of workspace while preserving base
++// resident experts and the sparse KV cache. Calls are idempotent.
++GGML_BACKEND_API bool ggml_backend_cuda_q122_large_pp_suspend(void);
++GGML_BACKEND_API bool ggml_backend_cuda_q122_large_pp_prefetch(void);
++GGML_BACKEND_API bool ggml_backend_cuda_q122_large_pp_resume(void);
++// HotSeat V2 elastic bank balancer: frees/restores whole expert banks around sparse KV growth.
++GGML_BACKEND_API bool ggml_backend_cuda_hotseat_v2_reserve_bytes(size_t bytes);
++// Large-PP retirement/tail-prefetch for the generic HotSeat V2 bank layout.
++GGML_BACKEND_API bool ggml_backend_cuda_hotseat_v2_large_pp_suspend(void);
++GGML_BACKEND_API bool ggml_backend_cuda_hotseat_v2_large_pp_prefetch(void);
++GGML_BACKEND_API bool ggml_backend_cuda_hotseat_v2_large_pp_resume(void);
+ 
+ // conduct allreduce operation between devices
+ GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 8934be5e1..d95a1c6ab 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1788,6 +1788,22 @@ struct ggml_backend_cuda_vmm_buffer_context {
+             const size_t run1 = i;
+             const size_t run_off = run0 * granularity;
+             const size_t run_size = (run1 - run0) * granularity;
++            // Before sparse KV commits new physical VRAM, repay elastic expert
++            // chunks until the configured low-water reserve can survive this
++            // exact allocation. This is the real KV<->expert see-saw.
++            // Let both elastic expert implementations make room before the
++            // sparse KV page is committed. Q122 R1 uses slice borrowing; HotSeat
++            // V2 uses whole per-layer expert banks so its fast V2 path stays intact.
++            if (!ggml_backend_cuda_hotseat_v2_reserve_bytes(run_size)) {
++                GGML_LOG_ERROR("HOTSEAT V2 DYNKV: cannot reserve %.2f MiB while preserving VRAM watermark\n",
++                               run_size/1048576.0);
++                return false;
++            }
++            if (!ggml_backend_cuda_q122_dynborrow_reserve_bytes(run_size)) {
++                GGML_LOG_ERROR("Q122 DYNKV VMM: cannot reserve %.2f MiB while preserving VRAM watermark\n",
++                               run_size/1048576.0);
++                return false;
++            }
+             hipMemGenericAllocationHandle_t handle{};
+             hipError_t err = hipMemCreate(&handle, run_size, &prop, 0);
+             if (err != hipSuccess) {
+diff --git a/ggml/src/ggml-cuda/hotexpert-cache.cu b/ggml/src/ggml-cuda/hotexpert-cache.cu
+index bb08e324e..2f0184d24 100644
+--- a/ggml/src/ggml-cuda/hotexpert-cache.cu
++++ b/ggml/src/ggml-cuda/hotexpert-cache.cu
+@@ -29,6 +29,7 @@ constexpr int MAX_EXPERTS = 1024;
+ struct cache_entry {
+     void * device_slices = nullptr;       // immutable base resident bank
+     void * borrow_slices = nullptr;       // elastic extension, retired as KV grows
++    void * prefetch_slices = nullptr;     // large-PP tail staging; never exposed until resume
+     const void ** device_table = nullptr;
+     const void * host_base = nullptr;
+     size_t bytes = 0;
+@@ -69,6 +70,12 @@ struct cache_state {
+     uint64_t adaptive_last_token = 0;
+     uint64_t adaptive_swaps = 0;
+     uint64_t adaptive_h2d_bytes = 0;
++    bool borrow_seeded = false; // initial/re-shrink balance done; KV growth may only repay, never reborrow
++    bool large_pp_suspended = false; // elastic expert slices retired while multi-token PP owns VRAM
++    cudaStream_t large_pp_prefetch_stream = nullptr;
++    bool large_pp_prefetch_queued = false;
++    size_t large_pp_prefetch_bytes = 0;
++    std::array<bool, MAX_LAYERS> large_pp_prefetch_layers{};
+     std::unordered_map<const void *, std::unique_ptr<cache_entry>> entries;
+     std::mutex mutex;
+ };
+@@ -395,17 +402,36 @@ static double q122_dynborrow_utility(const cache_state & s, int layer) {
+ }
+ 
+ static std::array<bool, MAX_LAYERS> q122_dynborrow_desired_layers(const cache_state & s) {
+-    struct cand { int layer; int delta; double utility; };
++    // Watermark controller: experts and sparse KV share the same physical VRAM.
++    // Treat all currently allocated borrow chunks as reclaimable, then choose the
++    // highest-utility whole-layer chunks that fit while leaving the configured
++    // low-water reserve. With Ornith's ~200 MiB/layer extension and a 400 MiB
++    // low watermark this naturally settles around 400-600 MiB free.
++    struct cand { int layer; int delta; double utility; size_t bytes; };
+     std::vector<cand> cands;
+     int total_slots = 0;
++
+     for (int layer = 0; layer < MAX_LAYERS; ++layer) {
+         const int base = ggml_hotexpert_q122_static_slots(layer, s.slots);
+         const int max_slots = q122_dynborrow_max_slots(s, layer, base);
+         const int delta = std::max(0, max_slots - base);
+         if (!delta) continue;
+-        cands.push_back({layer, delta, q122_dynborrow_utility(s, layer)});
++
++        int entries = 0;
++        size_t bytes = 0;
++        for (const auto & kv : s.entries) {
++            const cache_entry & e = *kv.second;
++            if (e.layer != layer) continue;
++            ++entries;
++            bytes += e.borrow_bytes;
++        }
++        // GATE/UP/DOWN must all be registered before a layer can be borrowed.
++        if (entries < 3 || bytes == 0) continue;
++
++        cands.push_back({layer, delta, q122_dynborrow_utility(s, layer), bytes});
+         total_slots += delta;
+     }
++
+     std::stable_sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) {
+         if (a.utility != b.utility) return a.utility > b.utility;
+         return a.layer < b.layer;
+@@ -416,23 +442,50 @@ static std::array<bool, MAX_LAYERS> q122_dynborrow_desired_layers(const cache_st
+         const long v = std::strtol(cap, nullptr, 10);
+         if (v >= 0) cap_slots = std::min(total_slots, int(v));
+     }
+-    int keep_slots = cap_slots;
+-    if (s.dyn_logical_rows > s.dyn_initial_rows && s.dyn_rows > s.dyn_initial_rows) {
+-        const uint64_t logical = s.dyn_logical_rows;
+-        const uint64_t rows = std::min<uint64_t>(s.dyn_rows, logical);
+-        const uint64_t span = logical - s.dyn_initial_rows;
+-        const uint64_t remaining = logical - rows;
+-        keep_slots = int((uint64_t(cap_slots) * remaining) / std::max<uint64_t>(1, span));
++
++    size_t free_now = 0, total_now = 0;
++    CUDA_CHECK(cudaSetDevice(s.device));
++    (void) cudaMemGetInfo(&free_now, &total_now);
++
++    size_t low_mib = 400;
++    if (const char * v = std::getenv("Q122_DYNKV_VRAM_LOW_MB")) {
++        const unsigned long long x = std::strtoull(v, nullptr, 10);
++        if (x > 0) low_mib = size_t(x);
++    } else if (const char * v = std::getenv("Q122_DYNKV_VRAM_RESERVE_MB")) {
++        const unsigned long long x = std::strtoull(v, nullptr, 10);
++        if (x > 0) low_mib = size_t(x);
+     }
++    const size_t low_bytes = low_mib << 20;
++
++    // If every elastic chunk were repaid, this is the VRAM available to split
++    // between KV and borrow experts. Rebuild the desired set from that baseline,
++    // so KV growth automatically removes experts and KV shrink re-borrows them.
++    const size_t free_if_repaid = free_now + s.borrow_allocated;
++    const size_t borrow_budget = free_if_repaid > low_bytes ? free_if_repaid - low_bytes : 0;
+ 
+     std::array<bool, MAX_LAYERS> desired{};
+-    int kept = 0;
++    int kept_slots = 0;
++    size_t kept_bytes = 0;
+     for (const auto & c : cands) {
+-        // Conservative whole-layer chunks: never exceed the linear byte budget.
+-        if (kept + c.delta <= keep_slots) {
+-            desired[size_t(c.layer)] = true;
+-            kept += c.delta;
+-        }
++        if (kept_slots + c.delta > cap_slots) continue;
++        if (kept_bytes + c.bytes > borrow_budget) continue;
++        desired[size_t(c.layer)] = true;
++        kept_slots += c.delta;
++        kept_bytes += c.bytes;
++    }
++
++    static size_t last_log_free = SIZE_MAX;
++    static size_t last_log_borrow = SIZE_MAX;
++    if (last_log_free == SIZE_MAX ||
++        (free_now > last_log_free ? free_now - last_log_free : last_log_free - free_now) >= (64u << 20) ||
++        kept_bytes != last_log_borrow) {
++        last_log_free = free_now;
++        last_log_borrow = kept_bytes;
++        std::fprintf(stderr,
++            "Q122 DYNBORROW_WATERMARK: free=%.1fMiB reclaimable=%.1fMiB low=%zuMiB desired=%.1fMiB slots=%d/%d rows=%u/%u\n",
++            free_now/1048576.0, s.borrow_allocated/1048576.0, low_mib,
++            kept_bytes/1048576.0, kept_slots, cap_slots, s.dyn_rows, s.dyn_logical_rows);
++        std::fflush(stderr);
+     }
+     return desired;
+ }
+@@ -583,7 +636,11 @@ static bool q122_dynborrow_set_layer(cache_state & s, int layer, bool active) {
+     bool already = true;
+     for (auto & kv : s.entries) {
+         cache_entry & e = *kv.second;
+-        if (e.layer == layer && e.borrow_exposed != active) { already = false; break; }
++        if (e.layer != layer) continue;
++        if (e.borrow_exposed != active) { already = false; break; }
++        // A pre-staged but hidden elastic chunk still consumes VRAM. A repay
++        // request must free it even when it was never exposed to MMID.
++        if (!active && e.borrow_slices) { already = false; break; }
+     }
+     if (already) return true;
+ 
+@@ -1408,14 +1465,26 @@ bool ggml_cuda_hotexpert_cache_seed_adaptive_counts(int n_layers, int n_experts)
+ bool ggml_cuda_hotexpert_cache_prepare_kv_rows(uint32_t rows, uint32_t logical_rows) {
+     std::lock_guard<std::mutex> lock(state.mutex);
+     initialize(state);
++    const uint32_t prev_rows = state.dyn_rows;
+     state.dyn_rows = rows;
+     state.dyn_logical_rows = logical_rows;
+     if (!state.enabled || !state.borrow_enabled) return true;
++    // A large-PP suspend owns the elastic-bank state until the final PP boundary.
++    // Context trimming/LCP changes can make rows temporarily shrink between requests;
++    // that must not be mistaken for permission to re-borrow all experts mid-prefill.
++    if (state.large_pp_suspended) return true;
+     if (rows == 0 && q122_adaptive_borrow_enabled()) {
+         if (!q122_adaptive_restore_baseline_locked(state)) return false;
+     }
+ 
+     const auto desired = q122_dynborrow_desired_layers(state);
++    // KV growth is monotonic within a live prompt. During growth, elastic experts
++    // are allowed to REPAY only. Re-borrowing on temporary free-VRAM spikes caused
++    // a 204 MiB layer to ping-pong 80->144->80 inside one tiny prompt, adding
++    // seconds of H2D + device-wide synchronization. Reborrow only for the initial
++    // balance, a real context shrink, or a session reset.
++    const bool allow_reborrow = !state.borrow_seeded || rows == 0 || rows < prev_rows;
++
+     // Repay first. This function is called before VMM allocates the new KV pages.
+     for (int layer = 0; layer < MAX_LAYERS; ++layer) {
+         bool exposed = false;
+@@ -1426,21 +1495,448 @@ bool ggml_cuda_hotexpert_cache_prepare_kv_rows(uint32_t rows, uint32_t logical_r
+             if (!q122_dynborrow_set_layer(state, layer, false)) return false;
+         }
+     }
+-    // Then expose pre-staged high-value borrow chunks that still fit the current context budget.
++
++    int borrow_shapes = 0;
++    if (allow_reborrow) {
++        // Expose high-value borrow chunks only when context demand actually fell
++        // (or during the first balance). This adds hysteresis for the 400-600 MiB
++        // target despite Ornith's ~204 MiB whole-layer borrow granularity.
++        for (int layer = 0; layer < MAX_LAYERS; ++layer) {
++            int base = 0, max_slots = 0; size_t bytes = 0;
++            if (!q122_dynborrow_layer_shape(state, layer, base, max_slots, bytes)) continue;
++            ++borrow_shapes;
++            if (!desired[size_t(layer)]) continue;
++            bool exposed = false;
++            for (auto & kv : state.entries) {
++                if (kv.second->layer != layer) continue;
++                exposed = exposed || kv.second->borrow_exposed;
++            }
++            if (!exposed) {
++                if (!q122_dynborrow_set_layer(state, layer, true)) return false;
++            }
++        }
++    }
++    if (!state.borrow_seeded && borrow_shapes > 0) {
++        state.borrow_seeded = true;
++        std::fprintf(stderr, "Q122 DYNBORROW: initial balance seeded at rows=%u\n", rows);
++        std::fflush(stderr);
++    }
++    return true;
++}
++
++
++static size_t q122_large_pp_prefetch_headroom_bytes() {
++    size_t mib = 2048;
++    if (const char * v = std::getenv("Q122_LARGE_PP_PREFETCH_HEADROOM_MB")) {
++        const unsigned long long x = std::strtoull(v, nullptr, 10);
++        if (x > 0) mib = size_t(x);
++    }
++    return mib << 20;
++}
++
++static cudaStream_t q122_large_pp_prefetch_stream_locked(cache_state & s) {
++    if (!s.large_pp_prefetch_stream) {
++        CUDA_CHECK(cudaSetDevice(s.device));
++        CUDA_CHECK(cudaStreamCreateWithFlags(&s.large_pp_prefetch_stream, cudaStreamNonBlocking));
++    }
++    return s.large_pp_prefetch_stream;
++}
++
++static void q122_large_pp_cancel_prefetch_locked(cache_state & s, const char * reason) {
++    if (!s.large_pp_prefetch_bytes) return;
++    CUDA_CHECK(cudaSetDevice(s.device));
++    if (s.large_pp_prefetch_stream && s.large_pp_prefetch_queued) {
++        CUDA_CHECK(cudaStreamSynchronize(s.large_pp_prefetch_stream));
++    }
++    size_t freed = 0;
++    for (auto & kv : s.entries) {
++        cache_entry & e = *kv.second;
++        if (!e.prefetch_slices) continue;
++        CUDA_CHECK(cudaFree(e.prefetch_slices));
++        e.prefetch_slices = nullptr;
++        freed += e.borrow_bytes;
++        s.allocated -= std::min(s.allocated, e.borrow_bytes);
++    }
++    s.large_pp_prefetch_layers.fill(false);
++    s.large_pp_prefetch_queued = false;
++    s.large_pp_prefetch_bytes = 0;
++    std::fprintf(stderr, "Q122 LARGE_PP: prefetch canceled reason=%s freed=%.1fMiB\n",
++        reason ? reason : "unknown", freed/1048576.0);
++    std::fflush(stderr);
++}
++
++extern "C" bool ggml_backend_cuda_q122_dynborrow_reserve_bytes(size_t bytes) {
++    std::lock_guard<std::mutex> lock(state.mutex);
++    initialize(state);
++    if (!state.enabled || !state.borrow_enabled || bytes == 0) return true;
++
++    CUDA_CHECK(cudaSetDevice(state.device));
++    size_t free_now = 0, total_now = 0;
++    (void) cudaMemGetInfo(&free_now, &total_now);
++
++    size_t low_mib = 400;
++    if (const char * v = std::getenv("Q122_DYNKV_VRAM_LOW_MB")) {
++        const unsigned long long x = std::strtoull(v, nullptr, 10);
++        if (x > 0) low_mib = size_t(x);
++    } else if (const char * v = std::getenv("Q122_DYNKV_VRAM_RESERVE_MB")) {
++        const unsigned long long x = std::strtoull(v, nullptr, 10);
++        if (x > 0) low_mib = size_t(x);
++    }
++    size_t effective_low_mib = low_mib;
++    if (const char * v = std::getenv("Q122_DYNKV_VRAM_GROWTH_GUARD_MB")) {
++        const unsigned long long guard = std::strtoull(v, nullptr, 10);
++        if (guard > 0 && state.dyn_logical_rows > state.dyn_initial_rows && state.dyn_rows > state.dyn_initial_rows) {
++            const uint64_t span = uint64_t(state.dyn_logical_rows) - state.dyn_initial_rows;
++            const uint64_t grown = std::min<uint64_t>(state.dyn_rows, state.dyn_logical_rows) - state.dyn_initial_rows;
++            effective_low_mib += size_t((guard * grown) / std::max<uint64_t>(1, span));
++        }
++    }
++    const size_t low_bytes = effective_low_mib << 20;
++    // Tail-prefetch memory is speculative and not visible to decode yet. If KV growth
++    // unexpectedly needs that headroom, cancel staging first rather than risking the
++    // low-water invariant or freeing a buffer while H2D is still in flight.
++    if (free_now < bytes + low_bytes && state.large_pp_prefetch_bytes > 0) {
++        q122_large_pp_cancel_prefetch_locked(state, "kv-reserve");
++        (void) cudaMemGetInfo(&free_now, &total_now);
++    }
++    if (free_now >= bytes + low_bytes) return true;
++
++    struct victim { int layer; double utility; size_t bytes; };
++    std::vector<victim> victims;
++    for (int layer = 0; layer < MAX_LAYERS; ++layer) {
++        bool physical = false;
++        size_t layer_bytes = 0;
++        for (const auto & kv : state.entries) {
++            const cache_entry & e = *kv.second;
++            if (e.layer != layer || !e.borrow_slices) continue;
++            physical = true;
++            layer_bytes += e.borrow_bytes;
++        }
++        if (physical && layer_bytes) victims.push_back({layer, q122_dynborrow_utility(state, layer), layer_bytes});
++    }
++    // Lowest-value elastic layers are repaid first. Base resident slices never
++    // move, so the operation is deterministic and decode-correct.
++    std::stable_sort(victims.begin(), victims.end(), [](const victim & a, const victim & b) {
++        if (a.utility != b.utility) return a.utility < b.utility;
++        return a.layer > b.layer;
++    });
++
++    size_t repaid = 0;
++    for (const auto & v : victims) {
++        if (free_now >= bytes + low_bytes) break;
++        if (!q122_dynborrow_set_layer(state, v.layer, false)) return false;
++        repaid += v.bytes;
++        (void) cudaMemGetInfo(&free_now, &total_now);
++    }
++
++    const bool ok = free_now >= bytes + low_bytes;
++    std::fprintf(stderr,
++        "Q122 DYNBORROW_RESERVE: need=%.1fMiB repaid=%.1fMiB free=%.1fMiB low=%zuMiB effective_low=%zuMiB ok=%d rows=%u/%u\n",
++        bytes/1048576.0, repaid/1048576.0, free_now/1048576.0, low_mib, effective_low_mib, ok ? 1 : 0,
++        state.dyn_rows, state.dyn_logical_rows);
++    std::fflush(stderr);
++    return ok;
++}
++
++
++extern "C" bool ggml_backend_cuda_q122_large_pp_suspend(void) {
++    std::lock_guard<std::mutex> lock(state.mutex);
++    initialize(state);
++    if (!state.enabled || !state.borrow_enabled || state.large_pp_suspended || state.entries.empty()) return true;
++
++    if (state.large_pp_prefetch_bytes > 0) {
++        q122_large_pp_cancel_prefetch_locked(state, "new-large-pp");
++    }
++    CUDA_CHECK(cudaSetDevice(state.device));
++    CUDA_CHECK(cudaDeviceSynchronize());
++
++    size_t free_before = 0, total_now = 0;
++    (void) cudaMemGetInfo(&free_before, &total_now);
++    size_t freed = 0;
++    std::array<bool, MAX_LAYERS> touched{};
++
++    // First publish base-only pointer tables. No compute is in flight at this server
++    // boundary, but keep a single device sync above rather than one sync per layer.
++    for (auto & kv : state.entries) {
++        cache_entry & e = *kv.second;
++        if (!e.borrow_slices && !e.borrow_exposed) continue;
++        std::vector<const void *> table;
++        q122_dynborrow_build_table(state, e, false, table);
++        CUDA_CHECK(cudaMemcpy(e.device_table, table.data(), table.size() * sizeof(void *), cudaMemcpyHostToDevice));
++        e.borrow_exposed = false;
++        if (e.layer >= 0 && e.layer < MAX_LAYERS) touched[size_t(e.layer)] = true;
++    }
++
++    for (int layer = 0; layer < MAX_LAYERS; ++layer) {
++        if (!touched[size_t(layer)]) continue;
++        q122_publish_borrow_mask(state, layer, false);
++        q122_publish_resident_mask(state, layer, false);
++        const int base = ggml_hotexpert_q122_static_slots(layer, state.slots);
++        ggml_hotexpert_q122_set_active_slots(layer, base);
++    }
++
++    // Now release every elastic allocation. Base resident slices stay warm, so
++    // decode correctness never depends on a costly full cache rebuild.
++    for (auto & kv : state.entries) {
++        cache_entry & e = *kv.second;
++        if (!e.borrow_slices) continue;
++        CUDA_CHECK(cudaFree(e.borrow_slices));
++        e.borrow_slices = nullptr;
++        e.borrow_retired = e.borrow_bytes > 0;
++        freed += e.borrow_bytes;
++        state.allocated -= std::min(state.allocated, e.borrow_bytes);
++        state.borrow_allocated -= std::min(state.borrow_allocated, e.borrow_bytes);
++    }
++
++    state.large_pp_suspended = true;
++    // The next explicit resume chooses a fresh high-value set from the current
++    // free-VRAM budget. Ordinary KV growth still remains repay-only.
++    size_t free_after = 0;
++    (void) cudaMemGetInfo(&free_after, &total_now);
++    std::fprintf(stderr,
++        "Q122 LARGE_PP: suspend freed=%.1fMiB free=%.1f->%.1fMiB rows=%u/%u entries=%zu\n",
++        freed/1048576.0, free_before/1048576.0, free_after/1048576.0,
++        state.dyn_rows, state.dyn_logical_rows, state.entries.size());
++    std::fflush(stderr);
++    return true;
++}
++
++extern "C" bool ggml_backend_cuda_q122_large_pp_prefetch(void) {
++    std::lock_guard<std::mutex> lock(state.mutex);
++    initialize(state);
++    if (!state.enabled || !state.borrow_enabled || !state.large_pp_suspended || state.entries.empty()) return true;
++    if (state.large_pp_prefetch_queued || state.large_pp_prefetch_bytes > 0) return true;
++
++    CUDA_CHECK(cudaSetDevice(state.device));
++    cudaStream_t stream = q122_large_pp_prefetch_stream_locked(state);
++    const auto desired = q122_dynborrow_desired_layers(state);
++    const size_t headroom = q122_large_pp_prefetch_headroom_bytes();
++    size_t free_before = 0, total_now = 0;
++    (void) cudaMemGetInfo(&free_before, &total_now);
++
++    size_t staged = 0;
++    int staged_layers = 0;
++    std::array<bool, MAX_LAYERS> staged_mask{};
++
++    // Stage whole GATE/UP/DOWN layer triplets only. Pointer tables remain base-only,
++    // so the next PP graph can run concurrently with these H2D copies without ever
++    // observing partially copied experts. Keep a generous PP headroom above the
++    // normal decode low-water; KV reserve can cancel staging if reality disagrees.
+     for (int layer = 0; layer < MAX_LAYERS; ++layer) {
+         if (!desired[size_t(layer)]) continue;
+-        bool exposed = false;
++        int base_slots = 0, max_slots = 0;
++        size_t layer_bytes = 0;
++        if (!q122_dynborrow_layer_shape(state, layer, base_slots, max_slots, layer_bytes)) continue;
++
++        size_t free_now = 0;
++        (void) cudaMemGetInfo(&free_now, &total_now);
++        if (free_now <= layer_bytes + headroom) continue;
++
++        std::vector<cache_entry *> layer_entries;
+         for (auto & kv : state.entries) {
+-            if (kv.second->layer != layer) continue;
+-            exposed = exposed || kv.second->borrow_exposed;
++            cache_entry & e = *kv.second;
++            if (e.layer == layer && e.max_slots > e.slots) layer_entries.push_back(&e);
+         }
+-        if (!exposed) {
+-            int base = 0, max_slots = 0; size_t bytes = 0;
+-            if (q122_dynborrow_layer_shape(state, layer, base, max_slots, bytes)) {
+-                if (!q122_dynborrow_set_layer(state, layer, true)) return false;
++        if (layer_entries.size() < 3) continue;
++
++        bool alloc_ok = true;
++        std::vector<cache_entry *> newly;
++        for (cache_entry * ep : layer_entries) {
++            cache_entry & e = *ep;
++            if (e.prefetch_slices || e.borrow_slices) { alloc_ok = false; break; }
++            cudaError_t err = cudaMalloc(&e.prefetch_slices, e.borrow_bytes);
++            if (err != cudaSuccess) {
++                (void) cudaGetLastError();
++                alloc_ok = false;
++                break;
+             }
++            newly.push_back(&e);
+         }
++        if (!alloc_ok) {
++            for (cache_entry * ep : newly) {
++                if (ep->prefetch_slices) {
++                    (void) cudaFree(ep->prefetch_slices);
++                    ep->prefetch_slices = nullptr;
++                }
++            }
++            continue;
++        }
++
++        for (cache_entry * ep : layer_entries) {
++            cache_entry & e = *ep;
++            const auto & borrow = q122_adaptive_borrow_list(state, layer);
++            for (int bi = 0; bi < int(borrow.size()) && bi < e.max_slots - e.slots; ++bi) {
++                const int expert = borrow[size_t(bi)];
++                if (expert < 0 || expert >= e.n_experts) continue;
++                void * dst = static_cast<char *>(e.prefetch_slices) + size_t(bi) * e.slice_bytes;
++                const void * src = static_cast<const char *>(e.host_base) + size_t(expert) * e.slice_bytes;
++                CUDA_CHECK(cudaMemcpyAsync(dst, src, e.slice_bytes, cudaMemcpyHostToDevice, stream));
++            }
++            state.allocated += e.borrow_bytes;
++            staged += e.borrow_bytes;
++        }
++        staged_mask[size_t(layer)] = true;
++        ++staged_layers;
+     }
++
++    if (staged > 0) {
++        state.large_pp_prefetch_layers = staged_mask;
++        state.large_pp_prefetch_bytes = staged;
++        state.large_pp_prefetch_queued = true;
++    }
++    size_t free_after = 0;
++    (void) cudaMemGetInfo(&free_after, &total_now);
++    std::fprintf(stderr,
++        "Q122 LARGE_PP: prefetch queued layers=%d bytes=%.1fMiB free=%.1f->%.1fMiB headroom=%.1fMiB rows=%u/%u\n",
++        staged_layers, staged/1048576.0, free_before/1048576.0, free_after/1048576.0,
++        headroom/1048576.0, state.dyn_rows, state.dyn_logical_rows);
++    std::fflush(stderr);
++    return true;
++}
++
++extern "C" bool ggml_backend_cuda_q122_large_pp_resume(void) {
++    std::lock_guard<std::mutex> lock(state.mutex);
++    initialize(state);
++    if (!state.enabled || !state.borrow_enabled || !state.large_pp_suspended || state.entries.empty()) return true;
++
++    CUDA_CHECK(cudaSetDevice(state.device));
++    cudaStream_t stream = q122_large_pp_prefetch_stream_locked(state);
++    size_t free_before = 0, total_now = 0;
++    (void) cudaMemGetInfo(&free_before, &total_now);
++    const size_t prefetched_bytes = state.large_pp_prefetch_bytes;
++
++    // If tail prefetch was queued, most or all of this wait should already have been
++    // hidden behind the final PP batches. Promote staging only after its stream is done.
++    if (state.large_pp_prefetch_queued) {
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++    }
++    for (auto & kv : state.entries) {
++        cache_entry & e = *kv.second;
++        if (!e.prefetch_slices) continue;
++        e.borrow_slices = e.prefetch_slices;
++        e.prefetch_slices = nullptr;
++        state.borrow_allocated += e.borrow_bytes;
++        e.borrow_retired = false;
++    }
++    state.large_pp_prefetch_layers.fill(false);
++    state.large_pp_prefetch_queued = false;
++    state.large_pp_prefetch_bytes = 0;
++
++    const auto desired = q122_dynborrow_desired_layers(state);
++    const size_t reserve = q122_dynborrow_reserve_bytes();
++    std::array<bool, MAX_LAYERS> activated{};
++    size_t restored = 0;
++    size_t late_h2d = 0;
++    int restored_layers = 0;
++
++    // Tail staging used a larger PP headroom than decode needs. Recompute the final
++    // desired set after the last KV growth and discard any speculative layer no longer
++    // justified by the 600 MiB decode watermark.
++    for (int layer = 0; layer < MAX_LAYERS; ++layer) {
++        if (desired[size_t(layer)]) continue;
++        for (auto & kv : state.entries) {
++            cache_entry & e = *kv.second;
++            if (e.layer != layer || !e.borrow_slices || e.borrow_exposed) continue;
++            CUDA_CHECK(cudaFree(e.borrow_slices));
++            e.borrow_slices = nullptr;
++            e.borrow_retired = e.borrow_bytes > 0;
++            state.allocated -= std::min(state.allocated, e.borrow_bytes);
++            state.borrow_allocated -= std::min(state.borrow_allocated, e.borrow_bytes);
++        }
++    }
++
++    // Expose prefetched layers immediately; allocate/copy only the remainder that is
++    // still useful for decode. All copies and pointer-table publication use the private
++    // non-blocking stream and one final stream sync, never a device-wide sync.
++    for (int layer = 0; layer < MAX_LAYERS; ++layer) {
++        if (!desired[size_t(layer)]) continue;
++        int base_slots = 0, max_slots = 0;
++        size_t layer_bytes = 0;
++        if (!q122_dynborrow_layer_shape(state, layer, base_slots, max_slots, layer_bytes)) continue;
++
++        std::vector<cache_entry *> layer_entries;
++        bool all_physical = true;
++        bool any_physical = false;
++        for (auto & kv : state.entries) {
++            cache_entry & e = *kv.second;
++            if (e.layer != layer || e.max_slots <= e.slots) continue;
++            layer_entries.push_back(&e);
++            any_physical = any_physical || e.borrow_slices != nullptr;
++            all_physical = all_physical && e.borrow_slices != nullptr;
++        }
++        if (layer_entries.size() < 3 || (any_physical && !all_physical)) continue;
++
++        if (!all_physical) {
++            size_t free_now = 0;
++            (void) cudaMemGetInfo(&free_now, &total_now);
++            if (free_now <= layer_bytes + reserve) continue;
++
++            bool alloc_ok = true;
++            std::vector<cache_entry *> newly;
++            for (cache_entry * ep : layer_entries) {
++                cache_entry & e = *ep;
++                cudaError_t err = cudaMalloc(&e.borrow_slices, e.borrow_bytes);
++                if (err != cudaSuccess) {
++                    (void) cudaGetLastError();
++                    alloc_ok = false;
++                    break;
++                }
++                newly.push_back(&e);
++            }
++            if (!alloc_ok) {
++                for (cache_entry * ep : newly) {
++                    if (ep->borrow_slices) { (void) cudaFree(ep->borrow_slices); ep->borrow_slices = nullptr; }
++                }
++                continue;
++            }
++            for (cache_entry * ep : layer_entries) {
++                cache_entry & e = *ep;
++                const auto & borrow = q122_adaptive_borrow_list(state, layer);
++                for (int bi = 0; bi < int(borrow.size()) && bi < e.max_slots - e.slots; ++bi) {
++                    const int expert = borrow[size_t(bi)];
++                    if (expert < 0 || expert >= e.n_experts) continue;
++                    void * dst = static_cast<char *>(e.borrow_slices) + size_t(bi) * e.slice_bytes;
++                    const void * src = static_cast<const char *>(e.host_base) + size_t(expert) * e.slice_bytes;
++                    CUDA_CHECK(cudaMemcpyAsync(dst, src, e.slice_bytes, cudaMemcpyHostToDevice, stream));
++                }
++                state.allocated += e.borrow_bytes;
++                state.borrow_allocated += e.borrow_bytes;
++                late_h2d += e.borrow_bytes;
++            }
++        }
++
++        for (cache_entry * ep : layer_entries) {
++            cache_entry & e = *ep;
++            std::vector<const void *> table;
++            q122_dynborrow_build_table(state, e, true, table);
++            CUDA_CHECK(cudaMemcpyAsync(e.device_table, table.data(), table.size() * sizeof(void *), cudaMemcpyHostToDevice, stream));
++            e.borrow_exposed = true;
++            e.borrow_retired = false;
++            restored += e.borrow_bytes;
++        }
++        activated[size_t(layer)] = true;
++        ++restored_layers;
++    }
++
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    for (int layer = 0; layer < MAX_LAYERS; ++layer) {
++        if (!activated[size_t(layer)]) continue;
++        q122_publish_borrow_mask(state, layer, true);
++        q122_publish_resident_mask(state, layer, true);
++        const int base = ggml_hotexpert_q122_static_slots(layer, state.slots);
++        const int mx = q122_dynborrow_max_slots(state, layer, base);
++        ggml_hotexpert_q122_set_active_slots(layer, mx);
++    }
++
++    state.large_pp_suspended = false;
++    state.borrow_seeded = true;
++    size_t free_after = 0;
++    (void) cudaMemGetInfo(&free_after, &total_now);
++    std::fprintf(stderr,
++        "Q122 LARGE_PP: resume layers=%d restored=%.1fMiB prefetched=%.1fMiB late_h2d=%.1fMiB free=%.1f->%.1fMiB rows=%u/%u\n",
++        restored_layers, restored/1048576.0, prefetched_bytes/1048576.0, late_h2d/1048576.0,
++        free_before/1048576.0, free_after/1048576.0, state.dyn_rows, state.dyn_logical_rows);
++    std::fflush(stderr);
+     return true;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/hotexpert-runtime.cu b/ggml/src/ggml-cuda/hotexpert-runtime.cu
+index cc95c3d96..1b6db1795 100644
+--- a/ggml/src/ggml-cuda/hotexpert-runtime.cu
++++ b/ggml/src/ggml-cuda/hotexpert-runtime.cu
+@@ -459,6 +459,28 @@ struct rt_state {
+     std::string profile_path;                     // auto-picked profile (fingerprint-scoped)
+     std::atomic<bool> rollback_requested{false};   // J5: restore previous map
+ 
++    // V2 + DynamicKV elastic whole-bank balancing. Unlike R1 slice borrowing,
++    // the legacy V2 fast path owns fixed per-layer banks. We can still make it
++    // elastic by retiring the coldest complete bank at a graph-safe KV boundary
++    // and recreating it when VRAM comes back. The model pointers in the device
++    // tables are rebuilt synchronously, so no kernel can observe freed VRAM.
++    bool v2_dynkv_balance = false;
++    uint64_t v2_dynkv_low_bytes = 400u << 20;
++    uint64_t v2_dynkv_high_bytes = 600u << 20;
++    std::array<bool, MAX_LAYERS> v2_dynkv_evicted{};
++    std::array<std::vector<int>, MAX_LAYERS> v2_dynkv_saved_experts;
++    std::mutex v2_dynkv_mutex;
++
++    // Large-PP tail prefetch for the generic HotSeat V2 bank layout. During a
++    // large prompt all non-full banks may be retired. Near the tail, hot banks
++    // are allocated and filled on a non-blocking side stream but stay hidden
++    // from pointer tables until the final PP graph has completed.
++    bool v2_large_pp_suspended = false;
++    cudaStream_t v2_large_pp_stream = nullptr;
++    bool v2_large_pp_prefetch_queued = false;
++    size_t v2_large_pp_prefetch_bytes = 0;
++    std::array<bool, MAX_LAYERS> v2_large_pp_prefetch_layers{};
++
+     // stage K: persistent runtime snapshot across unload/reload
+     std::string snapshot_path;
+     bool snapshot_loaded = false;
+@@ -2536,6 +2558,18 @@ static bool initialize_runtime(rt_state & s) {
+         GGML_LOG_INFO("HotExpert arena: enabled, target free %llu MiB (allocation after warm-up)\n",
+             (unsigned long long) (s.arena_target_free_bytes >> 20));
+     }
++    s.v2_dynkv_balance = [] {
++        const char * v = std::getenv("HOTSEAT_V2_DYNKV_BALANCE");
++        return v && std::strcmp(v, "1") == 0;
++    }();
++    if (s.v2_dynkv_balance) {
++        s.v2_dynkv_low_bytes  = uint64_t(env_int("HOTSEAT_V2_DYNKV_LOW_MB", 400)) << 20;
++        s.v2_dynkv_high_bytes = uint64_t(env_int("HOTSEAT_V2_DYNKV_HIGH_MB", 600)) << 20;
++        if (s.v2_dynkv_high_bytes < s.v2_dynkv_low_bytes) s.v2_dynkv_high_bytes = s.v2_dynkv_low_bytes;
++        GGML_LOG_INFO("HotSeat V2 DYNKV balance: low=%llu MiB high=%llu MiB\n",
++            (unsigned long long) (s.v2_dynkv_low_bytes >> 20),
++            (unsigned long long) (s.v2_dynkv_high_bytes >> 20));
++    }
+ 
+     s.worker = std::thread(worker_loop, &s);
+     if (s.v2_prefetch_enabled) {
+@@ -4114,6 +4148,437 @@ static void worker_loop(rt_state * s) {
+     }
+ }
+ 
++
++static double v2_dynkv_layer_utility(const rt_state & s, int layer) {
++    if (layer < 0 || layer >= s.n_layers) return 1e30;
++    const layer_t & L = s.layers[layer];
++    long double score = 0.0;
++    const auto & experts = s.v2_dynkv_evicted[size_t(layer)]
++        ? s.v2_dynkv_saved_experts[size_t(layer)] : L.experts;
++    for (int e : experts) {
++        if (e < 0 || e >= s.n_experts) continue;
++        score += s.v2_predictor_loaded ? s.v2_repeat_ppm[size_t(layer)][size_t(e)] : 0;
++        if (e < int(L.long_ewma.size())) score += L.long_ewma[size_t(e)] * 1000000.0;
++    }
++    // deterministic cold-start tie breaker: preserve earlier layers first.
++    score += static_cast<long double>(s.n_layers - layer) * 1e-6L;
++    return double(score);
++}
++
++static void v2_dynkv_upload_tables_and_bits(rt_state & s) {
++    for (int layer = 0; layer < s.n_layers; ++layer) {
++        for (int kind = 0; kind < MAX_TENSORS; ++kind) {
++            tensor_slot & t = s.layers[layer].tensors[kind];
++            if (!t.host_ptr) continue;
++            std::vector<const void *> content;
++            build_table_content(s, layer, kind, content);
++            for (int buf = 0; buf < 2; ++buf) {
++                CUDA_CHECK(cudaMemcpyAsync(const_cast<void *>(t.tables[buf]), content.data(),
++                    content.size() * sizeof(const void *), cudaMemcpyHostToDevice, s.side_stream));
++            }
++        }
++    }
++    std::vector<uint32_t> bits;
++    build_resident_bits(s, bits);
++    CUDA_CHECK(cudaMemcpyAsync(s.d_resident, bits.data(), bits.size() * sizeof(uint32_t),
++        cudaMemcpyHostToDevice, s.side_stream));
++    CUDA_CHECK(cudaStreamSynchronize(s.side_stream));
++}
++
++static bool v2_dynkv_evict_one(rt_state & s, size_t & freed_bytes) {
++    int victim = -1;
++    double worst = 1e300;
++    for (int layer = 0; layer < s.n_layers; ++layer) {
++        layer_t & L = s.layers[layer];
++        if (!L.registered || L.full || L.arena_full || L.top64_bank < 0) continue;
++        if (s.v2_dynkv_evicted[size_t(layer)]) continue;
++        if (L.top64_bank == s.spare_bank) continue;
++        bank_t & bank = s.top64_banks[size_t(L.top64_bank)];
++        if (!bank.base || bank.total == 0) continue;
++        const double u = v2_dynkv_layer_utility(s, layer);
++        if (u < worst) { worst = u; victim = layer; }
++    }
++    if (victim < 0) return false;
++
++    layer_t & L = s.layers[victim];
++    bank_t & bank = s.top64_banks[size_t(L.top64_bank)];
++    s.v2_dynkv_saved_experts[size_t(victim)] = L.experts;
++    L.experts.clear();
++    std::fill(L.slot_of.begin(), L.slot_of.end(), -1);
++    std::fill(L.in_shadow.begin(), L.in_shadow.end(), false);
++    std::fill(L.shadow_slot.begin(), L.shadow_slot.end(), -1);
++    L.own_free = L.slots;
++    L.shadow_used = 0;
++    s.v2_dynkv_evicted[size_t(victim)] = true;
++
++    v2_dynkv_upload_tables_and_bits(s);
++    CUDA_CHECK(cudaDeviceSynchronize());
++    void * old = bank.base;
++    const size_t bytes = bank.total;
++    bank.base = nullptr;
++    CUDA_CHECK(cudaFree(old));
++    freed_bytes = bytes;
++    std::fprintf(stderr, "HOTSEAT_V2_DYNKV: evict layer=%d bank=%d freed=%.1fMiB utility=%.3f\n",
++        victim, L.top64_bank, bytes/1048576.0, worst);
++    std::fflush(stderr);
++    return true;
++}
++
++static bool v2_dynkv_restore_one(rt_state & s, size_t free_now, size_t high_bytes, size_t & used_bytes) {
++    int best = -1;
++    double score = -1.0;
++    for (int layer = 0; layer < s.n_layers; ++layer) {
++        if (!s.v2_dynkv_evicted[size_t(layer)]) continue;
++        layer_t & L = s.layers[layer];
++        if (L.top64_bank < 0 || L.top64_bank == s.spare_bank) continue;
++        bank_t & bank = s.top64_banks[size_t(L.top64_bank)];
++        if (bank.base || bank.total == 0) continue;
++        if (free_now <= bank.total + high_bytes) continue;
++        const double u = v2_dynkv_layer_utility(s, layer);
++        if (u > score) { score = u; best = layer; }
++    }
++    if (best < 0) return false;
++
++    layer_t & L = s.layers[best];
++    bank_t & bank = s.top64_banks[size_t(L.top64_bank)];
++    void * ptr = nullptr;
++    cudaError_t err = cudaMalloc(&ptr, bank.total);
++    if (err != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    bank.base = ptr;
++    L.experts = s.v2_dynkv_saved_experts[size_t(best)];
++    if (L.experts.empty()) {
++        const auto & ranked = s.ranked_experts[size_t(best)];
++        const int take = std::min(L.slots, int(ranked.size()));
++        L.experts.assign(ranked.begin(), ranked.begin() + take);
++    }
++    std::fill(L.slot_of.begin(), L.slot_of.end(), -1);
++    std::fill(L.in_shadow.begin(), L.in_shadow.end(), false);
++    std::fill(L.shadow_slot.begin(), L.shadow_slot.end(), -1);
++    for (int slot = 0; slot < int(L.experts.size()); ++slot) L.slot_of[L.experts[size_t(slot)]] = slot;
++    L.own_free = std::max(0, L.slots - int(L.experts.size()));
++    L.shadow_used = 0;
++
++    for (int kind = 0; kind < MAX_TENSORS; ++kind) {
++        const tensor_slot & t = L.tensors[kind];
++        if (!t.host_ptr) continue;
++        for (int slot = 0; slot < int(L.experts.size()); ++slot) {
++            const int e = L.experts[size_t(slot)];
++            CUDA_CHECK(cudaMemcpyAsync(
++                static_cast<char *>(bank.base) + bank.offsets[kind] + size_t(slot) * size_t(t.stride),
++                static_cast<const char *>(t.host_ptr) + size_t(e) * size_t(t.stride),
++                size_t(t.stride), cudaMemcpyHostToDevice, s.side_stream));
++        }
++    }
++    CUDA_CHECK(cudaStreamSynchronize(s.side_stream));
++    s.v2_dynkv_evicted[size_t(best)] = false;
++    v2_dynkv_upload_tables_and_bits(s);
++    used_bytes = bank.total;
++    std::fprintf(stderr, "HOTSEAT_V2_DYNKV: restore layer=%d bank=%d used=%.1fMiB utility=%.3f\n",
++        best, L.top64_bank, bank.total/1048576.0, score);
++    std::fflush(stderr);
++    return true;
++}
++
++
++static size_t v2_large_pp_prefetch_headroom_bytes() {
++    size_t mib = 2048;
++    if (const char * v = std::getenv("Q122_LARGE_PP_PREFETCH_HEADROOM_MB")) {
++        const unsigned long long x = std::strtoull(v, nullptr, 10);
++        if (x > 0) mib = size_t(x);
++    }
++    return mib << 20;
++}
++
++static cudaStream_t v2_large_pp_stream_locked(rt_state & s) {
++    if (!s.v2_large_pp_stream) {
++        CUDA_CHECK(cudaSetDevice(s.device));
++        CUDA_CHECK(cudaStreamCreateWithFlags(&s.v2_large_pp_stream, cudaStreamNonBlocking));
++    }
++    return s.v2_large_pp_stream;
++}
++
++static void v2_large_pp_reset_prefetch_locked(rt_state & s, bool release_staged) {
++    if (s.v2_large_pp_stream && s.v2_large_pp_prefetch_queued) {
++        CUDA_CHECK(cudaStreamSynchronize(s.v2_large_pp_stream));
++    }
++    if (release_staged) {
++        for (int layer = 0; layer < s.n_layers; ++layer) {
++            if (!s.v2_large_pp_prefetch_layers[size_t(layer)]) continue;
++            layer_t & L = s.layers[layer];
++            if (L.top64_bank < 0 || L.top64_bank == s.spare_bank) continue;
++            bank_t & bank = s.top64_banks[size_t(L.top64_bank)];
++            // Staged banks are still logically evicted and therefore invisible.
++            if (s.v2_dynkv_evicted[size_t(layer)] && bank.base) {
++                CUDA_CHECK(cudaFree(bank.base));
++                bank.base = nullptr;
++            }
++        }
++    }
++    s.v2_large_pp_prefetch_layers.fill(false);
++    s.v2_large_pp_prefetch_queued = false;
++    s.v2_large_pp_prefetch_bytes = 0;
++}
++
++extern "C" bool ggml_backend_cuda_hotseat_v2_large_pp_suspend(void) {
++    rt_state & s = g_state;
++    if (!s.v2_dynkv_balance || !s.initialized || s.transit_only || s.mode == MODE_STATIC) return true;
++    std::lock_guard<std::mutex> guard(s.v2_dynkv_mutex);
++    if (s.v2_large_pp_suspended) return true;
++
++    CUDA_CHECK(cudaSetDevice(s.device));
++    if (s.v2_prefetch_stream) CUDA_CHECK(cudaStreamSynchronize(s.v2_prefetch_stream));
++    CUDA_CHECK(cudaStreamSynchronize(s.side_stream));
++    CUDA_CHECK(cudaDeviceSynchronize());
++    if (s.v2_large_pp_prefetch_bytes || s.v2_large_pp_prefetch_queued) {
++        v2_large_pp_reset_prefetch_locked(s, true);
++    }
++
++    size_t free_before = 0, total_now = 0;
++    (void) cudaMemGetInfo(&free_before, &total_now);
++    std::vector<int> victims;
++    size_t freed = 0;
++
++    // Retire all ordinary top-N banks in one transaction. Full layers, arena-backed
++    // layers and the spare pool stay resident because decode correctness may rely on them.
++    for (int layer = 0; layer < s.n_layers; ++layer) {
++        layer_t & L = s.layers[layer];
++        if (!L.registered || L.full || L.arena_full || L.top64_bank < 0) continue;
++        if (s.v2_dynkv_evicted[size_t(layer)] || L.top64_bank == s.spare_bank) continue;
++        bank_t & bank = s.top64_banks[size_t(L.top64_bank)];
++        if (!bank.base || bank.total == 0) continue;
++        s.v2_dynkv_saved_experts[size_t(layer)] = L.experts;
++        L.experts.clear();
++        std::fill(L.slot_of.begin(), L.slot_of.end(), -1);
++        std::fill(L.in_shadow.begin(), L.in_shadow.end(), false);
++        std::fill(L.shadow_slot.begin(), L.shadow_slot.end(), -1);
++        L.own_free = L.slots;
++        L.shadow_used = 0;
++        s.v2_dynkv_evicted[size_t(layer)] = true;
++        victims.push_back(layer);
++    }
++
++    if (!victims.empty()) {
++        // Publish host/base-only tables once, then free all retired banks.
++        v2_dynkv_upload_tables_and_bits(s);
++        CUDA_CHECK(cudaDeviceSynchronize());
++        for (int layer : victims) {
++            layer_t & L = s.layers[layer];
++            bank_t & bank = s.top64_banks[size_t(L.top64_bank)];
++            if (!bank.base) continue;
++            void * old = bank.base;
++            bank.base = nullptr;
++            freed += bank.total;
++            CUDA_CHECK(cudaFree(old));
++        }
++    }
++
++    s.v2_large_pp_suspended = true;
++    size_t free_after = 0;
++    (void) cudaMemGetInfo(&free_after, &total_now);
++    std::fprintf(stderr,
++        "HOTSEAT_V2 LARGE_PP: suspend layers=%zu freed=%.1fMiB free=%.1f->%.1fMiB\n",
++        victims.size(), freed/1048576.0, free_before/1048576.0, free_after/1048576.0);
++    std::fflush(stderr);
++    return true;
++}
++
++extern "C" bool ggml_backend_cuda_hotseat_v2_large_pp_prefetch(void) {
++    rt_state & s = g_state;
++    if (!s.v2_dynkv_balance || !s.initialized || !s.v2_large_pp_suspended || s.transit_only || s.mode == MODE_STATIC) return true;
++    std::lock_guard<std::mutex> guard(s.v2_dynkv_mutex);
++    if (s.v2_large_pp_prefetch_queued || s.v2_large_pp_prefetch_bytes > 0) return true;
++
++    CUDA_CHECK(cudaSetDevice(s.device));
++    cudaStream_t stream = v2_large_pp_stream_locked(s);
++    const size_t headroom = std::max<size_t>(v2_large_pp_prefetch_headroom_bytes(), s.v2_dynkv_low_bytes);
++    size_t free_before = 0, total_now = 0;
++    (void) cudaMemGetInfo(&free_before, &total_now);
++
++    struct cand { int layer; double utility; size_t bytes; };
++    std::vector<cand> cands;
++    for (int layer = 0; layer < s.n_layers; ++layer) {
++        if (!s.v2_dynkv_evicted[size_t(layer)]) continue;
++        layer_t & L = s.layers[layer];
++        if (L.full || L.arena_full || L.top64_bank < 0 || L.top64_bank == s.spare_bank) continue;
++        bank_t & bank = s.top64_banks[size_t(L.top64_bank)];
++        if (bank.base || bank.total == 0 || s.v2_dynkv_saved_experts[size_t(layer)].empty()) continue;
++        cands.push_back({layer, v2_dynkv_layer_utility(s, layer), bank.total});
++    }
++    std::stable_sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) {
++        if (a.utility != b.utility) return a.utility > b.utility;
++        return a.layer < b.layer;
++    });
++
++    size_t staged = 0;
++    int staged_layers = 0;
++    for (const auto & c : cands) {
++        size_t free_now = 0;
++        (void) cudaMemGetInfo(&free_now, &total_now);
++        if (free_now <= c.bytes + headroom) continue;
++
++        layer_t & L = s.layers[c.layer];
++        bank_t & bank = s.top64_banks[size_t(L.top64_bank)];
++        void * ptr = nullptr;
++        cudaError_t err = cudaMalloc(&ptr, bank.total);
++        if (err != cudaSuccess) {
++            (void) cudaGetLastError();
++            continue;
++        }
++        bank.base = ptr;
++        const auto & experts = s.v2_dynkv_saved_experts[size_t(c.layer)];
++        for (int kind = 0; kind < MAX_TENSORS; ++kind) {
++            const tensor_slot & t = L.tensors[kind];
++            if (!t.host_ptr) continue;
++            for (int slot = 0; slot < int(experts.size()) && slot < L.slots; ++slot) {
++                const int e = experts[size_t(slot)];
++                if (e < 0 || e >= s.n_experts) continue;
++                CUDA_CHECK(cudaMemcpyAsync(
++                    static_cast<char *>(bank.base) + bank.offsets[kind] + size_t(slot) * size_t(t.stride),
++                    static_cast<const char *>(t.host_ptr) + size_t(e) * size_t(t.stride),
++                    size_t(t.stride), cudaMemcpyHostToDevice, stream));
++            }
++        }
++        s.v2_large_pp_prefetch_layers[size_t(c.layer)] = true;
++        staged += bank.total;
++        ++staged_layers;
++    }
++
++    s.v2_large_pp_prefetch_bytes = staged;
++    s.v2_large_pp_prefetch_queued = staged > 0;
++    size_t free_after = 0;
++    (void) cudaMemGetInfo(&free_after, &total_now);
++    if (staged) {
++        std::fprintf(stderr,
++            "HOTSEAT_V2 LARGE_PP: prefetch queued layers=%d bytes=%.1fMiB free=%.1f->%.1fMiB headroom=%.1fMiB\n",
++            staged_layers, staged/1048576.0, free_before/1048576.0, free_after/1048576.0, headroom/1048576.0);
++        std::fflush(stderr);
++    }
++    return true;
++}
++
++extern "C" bool ggml_backend_cuda_hotseat_v2_large_pp_resume(void) {
++    rt_state & s = g_state;
++    if (!s.v2_dynkv_balance || !s.initialized || !s.v2_large_pp_suspended || s.transit_only || s.mode == MODE_STATIC) return true;
++    std::lock_guard<std::mutex> guard(s.v2_dynkv_mutex);
++    CUDA_CHECK(cudaSetDevice(s.device));
++
++    const size_t prefetched = s.v2_large_pp_prefetch_bytes;
++    int prefetched_layers = 0;
++    if (s.v2_large_pp_stream && s.v2_large_pp_prefetch_queued) {
++        CUDA_CHECK(cudaStreamSynchronize(s.v2_large_pp_stream));
++    }
++
++    // Commit all completed staged banks atomically at the final PP boundary.
++    for (int layer = 0; layer < s.n_layers; ++layer) {
++        if (!s.v2_large_pp_prefetch_layers[size_t(layer)]) continue;
++        layer_t & L = s.layers[layer];
++        if (L.top64_bank < 0 || L.top64_bank == s.spare_bank) continue;
++        bank_t & bank = s.top64_banks[size_t(L.top64_bank)];
++        if (!bank.base) continue;
++        L.experts = s.v2_dynkv_saved_experts[size_t(layer)];
++        std::fill(L.slot_of.begin(), L.slot_of.end(), -1);
++        std::fill(L.in_shadow.begin(), L.in_shadow.end(), false);
++        std::fill(L.shadow_slot.begin(), L.shadow_slot.end(), -1);
++        for (int slot = 0; slot < int(L.experts.size()) && slot < L.slots; ++slot) {
++            const int e = L.experts[size_t(slot)];
++            if (e >= 0 && e < s.n_experts) L.slot_of[e] = slot;
++        }
++        L.own_free = std::max(0, L.slots - int(L.experts.size()));
++        L.shadow_used = 0;
++        s.v2_dynkv_evicted[size_t(layer)] = false;
++        ++prefetched_layers;
++    }
++    if (prefetched_layers) v2_dynkv_upload_tables_and_bits(s);
++
++    s.v2_large_pp_prefetch_layers.fill(false);
++    s.v2_large_pp_prefetch_queued = false;
++    s.v2_large_pp_prefetch_bytes = 0;
++
++    // Restore any remaining high-value banks synchronously only if they still fit
++    // above the normal high watermark. Tail prefetch should make this remainder small.
++    size_t free_now = 0, total_now = 0;
++    (void) cudaMemGetInfo(&free_now, &total_now);
++    size_t late = 0;
++    int late_layers = 0;
++    for (;;) {
++        size_t one = 0;
++        if (!v2_dynkv_restore_one(s, free_now, s.v2_dynkv_high_bytes, one)) break;
++        late += one;
++        ++late_layers;
++        (void) cudaMemGetInfo(&free_now, &total_now);
++    }
++
++    s.v2_large_pp_suspended = false;
++    std::fprintf(stderr,
++        "HOTSEAT_V2 LARGE_PP: resume prefetched_layers=%d prefetched=%.1fMiB late_layers=%d late_h2d=%.1fMiB free=%.1fMiB\n",
++        prefetched_layers, prefetched/1048576.0, late_layers, late/1048576.0, free_now/1048576.0);
++    std::fflush(stderr);
++    return true;
++}
++
++extern "C" bool ggml_backend_cuda_hotseat_v2_reserve_bytes(size_t bytes) {
++    rt_state & s = g_state;
++    if (!s.v2_dynkv_balance || !s.initialized || s.transit_only || s.mode == MODE_STATIC) return true;
++    std::lock_guard<std::mutex> guard(s.v2_dynkv_mutex);
++    CUDA_CHECK(cudaSetDevice(s.device));
++
++    // During large PP, keep ordinary banks retired. A tail-prefetched bank is
++    // still invisible, so it is safe to throw away if a KV growth needs the room.
++    if (s.v2_large_pp_suspended) {
++        size_t free_now = 0, total_now = 0;
++        (void) cudaMemGetInfo(&free_now, &total_now);
++        if (free_now < bytes + s.v2_dynkv_low_bytes && s.v2_large_pp_prefetch_bytes > 0) {
++            const size_t canceled = s.v2_large_pp_prefetch_bytes;
++            v2_large_pp_reset_prefetch_locked(s, true);
++            (void) cudaMemGetInfo(&free_now, &total_now);
++            std::fprintf(stderr,
++                "HOTSEAT_V2 LARGE_PP: prefetch canceled=%.1fMiB for KV need=%.1fMiB free=%.1fMiB low=%.1fMiB\n",
++                canceled/1048576.0, bytes/1048576.0, free_now/1048576.0, s.v2_dynkv_low_bytes/1048576.0);
++            std::fflush(stderr);
++        }
++        return free_now >= bytes + s.v2_dynkv_low_bytes;
++    }
++
++    // Capacity changes happen at the KV apply boundary before a new graph is
++    // launched. Drain both side paths so no prefetch or table upload can retain
++    // a pointer into a bank that is about to be freed.
++    if (s.v2_prefetch_stream) CUDA_CHECK(cudaStreamSynchronize(s.v2_prefetch_stream));
++    CUDA_CHECK(cudaStreamSynchronize(s.side_stream));
++    CUDA_CHECK(cudaDeviceSynchronize());
++
++    size_t free_now = 0, total_now = 0;
++    (void) cudaMemGetInfo(&free_now, &total_now);
++    size_t freed = 0;
++    while (free_now < bytes + s.v2_dynkv_low_bytes) {
++        size_t one = 0;
++        if (!v2_dynkv_evict_one(s, one)) break;
++        freed += one;
++        (void) cudaMemGetInfo(&free_now, &total_now);
++    }
++    const bool ok = free_now >= bytes + s.v2_dynkv_low_bytes;
++    size_t restored = 0;
++    if (bytes == 0 && ok) {
++        // Hysteretic refill: only recreate a bank if its whole allocation fits
++        // while leaving the high watermark untouched.
++        for (;;) {
++            size_t one = 0;
++            if (!v2_dynkv_restore_one(s, free_now, s.v2_dynkv_high_bytes, one)) break;
++            restored += one;
++            (void) cudaMemGetInfo(&free_now, &total_now);
++        }
++    }
++    if (freed || restored) {
++        std::fprintf(stderr, "HOTSEAT_V2_DYNKV: need=%.1fMiB freed=%.1fMiB restored=%.1fMiB free=%.1fMiB low=%.1f high=%.1f ok=%d\n",
++            bytes/1048576.0, freed/1048576.0, restored/1048576.0, free_now/1048576.0,
++            s.v2_dynkv_low_bytes/1048576.0, s.v2_dynkv_high_bytes/1048576.0, ok ? 1 : 0);
++        std::fflush(stderr);
++    }
++    return ok;
++}
++
+ // ---------------------------------------------------------------------------
+ // shutdown
+ // ---------------------------------------------------------------------------
+@@ -4437,6 +4902,11 @@ static void shutdown_runtime(rt_state & s) {
+             (unsigned long long) s.v2_persistent_reused.load(std::memory_order_relaxed));
+     }
+     dump_v2_profile(s);
++    if (s.v2_large_pp_stream) {
++        CUDA_CHECK(cudaStreamSynchronize(s.v2_large_pp_stream));
++        CUDA_CHECK(cudaStreamDestroy(s.v2_large_pp_stream));
++        s.v2_large_pp_stream = nullptr;
++    }
+     for (auto & bank : s.full_banks)  if (bank.base)  CUDA_CHECK(cudaFree(bank.base));
+     for (auto & bank : s.top64_banks) if (bank.base)  CUDA_CHECK(cudaFree(bank.base));
+     for (int layer = 0; layer < s.n_layers; ++layer) {
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index b09e0d7fe..e80415d72 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2870,6 +2870,27 @@ bool llama_kv_cache_context::apply() {
+         return false;
+     }
+ 
++    // HotSeat V2 uses fixed-address tables but elastic whole banks. After the
++    // actual KV allocation is visible, refill retired banks only when a complete
++    // bank fits while preserving the configured high watermark.
++    if (!ggml_backend_cuda_hotseat_v2_reserve_bytes(0)) {
++        LLAMA_LOG_ERROR("%s: failed post-map HotSeat V2 dynamic expert reconciliation at %d/%d rows\n",
++                __func__, dynkv_rows, kv->get_size());
++        status = LLAMA_MEMORY_STATUS_FAILED_COMPUTE;
++        return false;
++    }
++
++    // Reconcile once more after physical VMM pages are committed. The pre-map
++    // pass makes room, while this post-map pass observes the real allocator
++    // footprint and repays/re-borrows experts back to the VRAM watermark before
++    // the compute graph runs.
++    if (!ggml_backend_cuda_q122_dynborrow_prepare(dynkv_rows, kv->get_size())) {
++        LLAMA_LOG_ERROR("%s: failed post-map Q122 dynamic expert reconciliation at %d/%d rows\n",
++                __func__, dynkv_rows, kv->get_size());
++        status = LLAMA_MEMORY_STATUS_FAILED_COMPUTE;
++        return false;
++    }
++
+     if (dynkv_rows != n_kv) {
+         static uint32_t last_test_rows = 0;
+         if (last_test_rows != dynkv_rows) {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index f5477356d..264b2b37c 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -11,6 +11,9 @@
+ #include "common.h"
+ #include "fit.h"
+ #include "llama.h"
++#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
++#include "ggml-cuda.h"
++#endif
+ #include "log.h"
+ #include "sampling.h"
+ #include "speculative.h"
+@@ -19,6 +22,7 @@
+ 
+ #include <algorithm>
+ #include <cstddef>
++#include <cstdlib>
+ #include <cinttypes>
+ #include <exception>
+ #include <memory>
+@@ -3493,6 +3497,64 @@ private:
+                     const auto & spans = slot.task->params.message_spans;
+                     const auto last_user_pos = spans.last_user_message_pos();
+ 
++                    // Q122/HotSeat: large-cache + tiny-suffix prompts are pathological on the
++                    // normal multi-token prefill graph: it bypasses the decode-only Hybrid/HotSeat
++                    // MMID path, so even a handful of tokens can take many seconds at 100K context.
++                    // For a small uncached suffix, feed one token per server decode iteration. Large
++                    // prefills keep the normal 2048-token batch path untouched. Opt-in by env only.
++                    static const int q122_inc_pp_max = [] {
++                        const char * v = std::getenv("Q122_INCREMENTAL_PP_MAX_TOKENS");
++                        return (v && *v) ? std::max(0, std::atoi(v)) : 0;
++                    }();
++                    static const int q122_inc_pp_min_cache = [] {
++                        const char * v = std::getenv("Q122_INCREMENTAL_PP_MIN_CACHE");
++                        return (v && *v) ? std::max(0, std::atoi(v)) : 0;
++                    }();
++                    const int q122_inc_pp_remaining = slot.task->n_tokens() - slot.prompt.n_tokens();
++
++                    // Large suffixes want the opposite memory layout from decode. Multi-token
++                    // prefill never consumes the decode-only elastic HotExpert bank, so temporarily
++                    // retire those slices and give the freed VRAM to PP workspace. The final prefill
++                    // batch restores the bank once, with a batched H2D resume.
++                    static const int q122_large_pp_min = [] {
++                        const char * v = std::getenv("Q122_LARGE_PP_MIN_TOKENS");
++                        return (v && *v) ? std::max(0, std::atoi(v)) : 0;
++                    }();
++                    const bool q122_large_pp = q122_large_pp_min > 0 && q122_inc_pp_remaining >= q122_large_pp_min;
++                    static const int q122_large_pp_prefetch_tail = [] {
++                        const char * v = std::getenv("Q122_LARGE_PP_PREFETCH_TAIL_TOKENS");
++                        return (v && *v) ? std::max(0, std::atoi(v)) : 0;
++                    }();
++#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
++                    if (q122_large_pp && slot.stats.n_prompt_processed == 0) {
++                        SLT_INF(slot, "Q122 LARGE_PP: suffix=%d cached=%d threshold=%d; suspending elastic experts\n",
++                            q122_inc_pp_remaining, slot.stats.n_prompt_cached, q122_large_pp_min);
++                        if (!ggml_backend_cuda_q122_large_pp_suspend()) {
++                            SLT_WRN(slot, "%s", "Q122 LARGE_PP: suspend failed; continuing with current cache layout\n");
++                        }
++                        if (!ggml_backend_cuda_hotseat_v2_large_pp_suspend()) {
++                            SLT_WRN(slot, "%s", "HOTSEAT_V2 LARGE_PP: suspend failed; continuing with current cache layout\n");
++                        }
++                    }
++                    if (q122_large_pp_prefetch_tail > 0 && slot.stats.n_prompt_processed > 0 &&
++                        q122_inc_pp_remaining > 0 && q122_inc_pp_remaining <= q122_large_pp_prefetch_tail) {
++                        if (!ggml_backend_cuda_q122_large_pp_prefetch()) {
++                            SLT_WRN(slot, "%s", "Q122 LARGE_PP: tail prefetch failed; falling back to resume-time restore\n");
++                        }
++                        if (!ggml_backend_cuda_hotseat_v2_large_pp_prefetch()) {
++                            SLT_WRN(slot, "%s", "HOTSEAT_V2 LARGE_PP: tail prefetch failed; falling back to resume-time restore\n");
++                        }
++                    }
++#endif
++
++                    const bool q122_inc_pp_serial = q122_inc_pp_max > 0 &&
++                        slot.stats.n_prompt_cached >= q122_inc_pp_min_cache &&
++                        q122_inc_pp_remaining > 0 && q122_inc_pp_remaining <= q122_inc_pp_max;
++                    if (q122_inc_pp_serial && slot.stats.n_prompt_processed == 0) {
++                        SLT_INF(slot, "Q122 incremental PP: serial suffix=%d cached=%d threshold=%d/%d\n",
++                            q122_inc_pp_remaining, slot.stats.n_prompt_cached, q122_inc_pp_max, q122_inc_pp_min_cache);
++                    }
++
+                     // add prompt tokens for processing in the current batch
+                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                         // get next token to process
+@@ -3549,6 +3611,10 @@ private:
+                                 break;
+                             }
+                         }
++
++                        if (q122_inc_pp_serial && (batch.size() - n_tokens_prev) >= 1) {
++                            break;
++                        }
+                     }
+ 
+                     // the number of tokens added to the batch for the current slot
+@@ -3806,6 +3872,17 @@ private:
+ 
+                 GGML_ASSERT(slot.task->need_sampling());
+ 
++#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
++                // The final PP graph has completed at this point. Restore only the elastic
++                // decode bank now; the sparse KV stays untouched and base experts remained warm.
++                if (!ggml_backend_cuda_q122_large_pp_resume()) {
++                    SLT_WRN(slot, "%s", "Q122 LARGE_PP: resume failed; decode continues base-resident only\n");
++                }
++                if (!ggml_backend_cuda_hotseat_v2_large_pp_resume()) {
++                    SLT_WRN(slot, "%s", "HOTSEAT_V2 LARGE_PP: resume failed; decode continues with surviving banks\n");
++                }
++#endif
++
+                 // prompt evaluated for next-token prediction
+                 slot.state = SLOT_STATE_GENERATING;
+ 

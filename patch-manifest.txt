@@ -71,3 +71,13 @@ IMPORTANT
 ---------
 The actual patch contents are recoverable exactly from the tagged Git worktrees above.
 Do not delete those worktrees/tags before exporting patches when preparing a future migration.
+
+2026-09-07 UPDATE
+-----------------
+See:
+  patch-manifest-20260907.txt
+  docs/2026-09-07-dynkv-tiny-largepp-tail-prefetch.md
+  patches/hotseat-dynkv-largepp-tailprefetch-from-bebc9350.patch
+
+Public upstream base:
+  bebc9350ecc42a31ad119da1513998386671cf5b

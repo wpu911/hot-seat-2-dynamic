@@ -1718,3 +1718,37 @@ tag q122-r1-stable-20260823
 ```
 
 这三个 commit 能把当前整个优化链重新钉回去。
+
+---
+
+## 2026-09-07 production update
+
+Latest AMD ROCm production work adds:
+
+- DynamicKV low-water VRAM balancing
+- Tiny / Normal / Large PP automatic routing
+- Large-PP elastic-expert suspend and tail prefetch
+- HotSeat V2 Large-PP support for Qwen3.6 text and vision
+- Q122 Large-PP suspend hysteresis fix
+- Ornith text/vision 4096 batch + Flash Attention where validated
+
+Portable artifacts:
+
+- `patches/hotseat-dynkv-largepp-tailprefetch-from-bebc9350.patch`
+- `patches/20260907-working-delta-from-b96fdd6fc.patch`
+- `config-snippets-20260907.yaml`
+- `docs/2026-09-07-dynkv-tiny-largepp-tail-prefetch.md`
+- `patch-manifest-20260907.txt`
+- `SHA256SUMS-20260907.txt`
+
+Public upstream llama.cpp base: `bebc9350ecc42a31ad119da1513998386671cf5b`.
+
+Selected measured results:
+
+- Ornith text warm large incremental PP: **141.15 tok/s**, TG **46.96 tok/s**
+- Qwen3.6 text warm incremental PP: **859.31 tok/s**, TG **57.51 tok/s**
+- Qwen3.6 vision fresh PP: **907.25 tok/s**, TG **55.62 tok/s**
+- Ornith vision warm large incremental PP: **113.24 tok/s**, TG **50.03 tok/s**
+- Ornith text direct 240K validation: PP **307.19 tok/s**, TG **35.09 tok/s**, with no KV grow/reserve failure
+
+The full patch was generated directly from the public upstream base and passed `git apply --check` against that exact base before upload.

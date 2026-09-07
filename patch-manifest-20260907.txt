@@ -1,0 +1,33 @@
+HotSeat / DynamicKV / PP pipeline update
+Generated: 2026-09-07
+
+PUBLIC UPSTREAM BASE
+--------------------
+llama.cpp commit:
+  bebc9350ecc42a31ad119da1513998386671cf5b
+
+CUSTOM HEAD BEFORE WORKING-TREE UPDATE
+--------------------------------------
+  b96fdd6fc3f610b77c2389ee6da645dfd0c7018a
+
+FULL PORTABLE PATCH
+-------------------
+  patches/hotseat-dynkv-largepp-tailprefetch-from-bebc9350.patch
+
+Generated with:
+  git diff --binary bebc9350ecc42a31ad119da1513998386671cf5b
+
+INCREMENTAL WORKING-TREE DELTA
+------------------------------
+  patches/20260907-working-delta-from-b96fdd6fc.patch
+
+Generated with:
+  git diff --binary HEAD
+
+PRODUCTION CONFIG SNAPSHOT
+--------------------------
+  config-snippets-20260907.yaml
+
+DOCUMENTATION
+-------------
+  docs/2026-09-07-dynkv-tiny-largepp-tail-prefetch.md
