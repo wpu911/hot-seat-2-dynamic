@@ -1,0 +1,12 @@
+{
+  "upstream_base": "bebc9350ecc42a31ad119da1513998386671cf5b",
+  "custom_head": "b96fdd6fc3f610b77c2389ee6da645dfd0c7018a",
+  "full_patch": "patches/ornith-pptg-balanced-from-bebc9350.patch",
+  "delta_patch": "patches/20260907-pptg-working-delta-from-b96fdd6fc.patch",
+  "result_tree": "04334b58cdebdfd7d54e577759387e3cae498de9",
+  "apply_check": "passed on public upstream base; resulting tracked tree equals current source",
+  "delta_warning": "Contains the earlier DynamicKV changes as well. Do not stack on older 20260907 working delta.",
+  "full_patch_warning": "Apply to a clean checkout of upstream_base. Do not stack on older full patches.",
+  "build_validation": "Current production used incremental compilation; this publication checks source patch application, not a new full ROCm rebuild.",
+  "ai_assistance": "Implementation, packaging and documentation were assisted by Codex; benchmark measurements came from the stated local host."
+}

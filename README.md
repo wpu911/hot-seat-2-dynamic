@@ -1,3 +1,11 @@
+# Latest: Ornith PP/TG balance upgrade
+
+2026-09-07: [Design, measurements and reproduction](docs/2026-09-07-ornith-pptg-balanced.md) | [中文技术帖](docs/xiaohongshu-ornith-pptg-20260907.md)
+
+On the documented Ornith Q8_0 replay (32k cached + 8k new tokens), PP improves from 152.2 to 1176.2 tok/s while main-test TG stays approximately unchanged. This is a workload-specific PP result, not a universal generation speedup.
+
+Use the new `ornith-pptg-balanced-from-bebc9350.patch` on its stated clean upstream base. Older patches and documentation below are historical snapshots; do not stack the full patches.
+
 # llama.cpp / llama-swap HotSeat 升级迁移备忘录
 ## Ornith 1.5 HotSeat V2 + Qwen3.5-122B R1
 生成日期：2026-08-23

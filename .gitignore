@@ -1,0 +1,3 @@
+benchmarks/**/runs/
+**/__pycache__/
+*.pyc
