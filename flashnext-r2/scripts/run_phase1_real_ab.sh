@@ -6,28 +6,14 @@ set -euo pipefail
 # Scope is deliberately narrow:
 #   1) freeze exact production source
 #   2) build Sep-18 Modern Foundation with the exact production custom overlay
-#   3) A/B production vs Modern Foundation through llama-swap :8090
-#   4) add PR #28243 MTP on the same foundation and A/B it
-#   5) prepare PR #28313 ROCm TOP_K and run the 32K/64K smoke ladder
+#   3) verify qwen4exp native recurrent rollback survived the forward-port
+#   4) A/B production vs Modern Foundation through llama-swap :8090
+#   5) add PR #28243 MTP on the same foundation and A/B it
+#   6) prepare PR #28313 ROCm TOP_K and run the 32K/64K smoke ladder
 #
 # It NEVER replaces qwen3.8-flash-next:256k and never edits the production
 # runtime path. Candidate aliases are additive only. Every config mutation is
 # preceded by a timestamped backup under /app/share/backup.
-#
-# Typical execution inside llama_box_714:
-#   bash flashnext-r2/scripts/run_phase1_real_ab.sh
-#
-# Resume:
-#   START_AT=foundation bash ...
-#   START_AT=mtp        bash ...
-#   START_AT=topk       bash ...
-#
-# Stop:
-#   STOP_AFTER=foundation bash ...
-#   STOP_AFTER=mtp        bash ...
-#
-# Optional long confirmation after TOP_K smoke passes:
-#   TOPK_FULL=1 bash ...
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${CONFIG:-/app/share/llama_box/config/config-rocm714.yaml}"
@@ -94,20 +80,16 @@ echo "log=$MASTER_LOG"
 [[ -e "$PROD_SRC/.git" ]] || { echo "ERROR production source is not a git tree: $PROD_SRC" >&2; exit 11; }
 require_alias "$PROD_ALIAS"
 
-# Back up the exact config before any helper can add experiment aliases.
 cp -a "$CONFIG" "$BACKUP_DIR/config-rocm714.yaml.before"
 sha256sum "$CONFIG" "$BACKUP_DIR/config-rocm714.yaml.before" | tee "$BACKUP_DIR/config.sha256"
 note "CONFIG_BACKUP=$BACKUP_DIR/config-rocm714.yaml.before"
 
-# llama-swap health. This is intentionally read-only.
 curl -fsS --max-time 20 http://127.0.0.1:8090/v1/models > "$RUN_DIR/models-preflight.json" || {
   echo "ERROR llama-swap :8090 is not healthy" >&2
   exit 12
 }
 curl -fsS --max-time 20 http://127.0.0.1:8090/running > "$RUN_DIR/running-preflight.json" 2>/dev/null || true
 
-# Machine facts are evidence, not assumptions. Do not fail if a diagnostic tool
-# is absent; the build itself will be the authoritative backend check.
 {
   echo "=== disk ==="
   df -h /app/share 2>/dev/null || df -h .
@@ -121,7 +103,6 @@ curl -fsS --max-time 20 http://127.0.0.1:8090/running > "$RUN_DIR/running-prefli
   fi
 } | tee "$RUN_DIR/machine-preflight.txt"
 
-# Production source may intentionally be dirty. Record it, never clean/reset it.
 git -C "$PROD_SRC" rev-parse HEAD | tee "$RUN_DIR/production-head.txt"
 git -C "$PROD_SRC" status --short | tee "$RUN_DIR/production-status.txt" || true
 
@@ -156,9 +137,15 @@ if phase_enabled foundation; then
   }
   require_alias "$FOUNDATION_ALIAS"
 
-  # Prevent old optimizations from being accidentally re-ported on top of a
-  # foundation that already contains their modern equivalents.
   run_phase foundation_carryover_audit bash "$SCRIPT_DIR/verify_modern_foundation_carryover.sh"
+
+  # Native recurrent rollback (#28123) is a hard prerequisite for modern MTP.
+  # Without it, qwen4exp can fall back to whole-state speculative checkpoints,
+  # which is exactly the old catastrophic TG path we do not want to benchmark.
+  run_phase foundation_rs_rollback_audit env SRC="$FOUNDATION_SRC" CONFIG="$CONFIG" ALIAS="$FOUNDATION_ALIAS" \
+    bash "$SCRIPT_DIR/verify_qwen4exp_native_rs_rollback.sh"
+  note "NATIVE_RS_ROLLBACK=PASS"
+
   run_phase foundation_ab bash "$SCRIPT_DIR/run_modern_foundation_ab.sh"
   note "FOUNDATION_RESULT=PASS"
   note "FOUNDATION_SRC=$FOUNDATION_SRC"
@@ -180,8 +167,11 @@ if phase_enabled mtp; then
   }
   require_alias "$FOUNDATION_ALIAS"
 
-  # Layout inspection is read-only and catches sidecar/shared-head mismatches
-  # before a long compile.
+  # Recheck rollback plumbing when resuming directly at MTP. The source support
+  # is useless if the selected llama-swap alias is no longer draft-mtp/n-max>0.
+  run_phase mtp_rs_rollback_audit env SRC="$FOUNDATION_SRC" CONFIG="$CONFIG" ALIAS="$FOUNDATION_ALIAS" \
+    bash "$SCRIPT_DIR/verify_qwen4exp_native_rs_rollback.sh"
+
   run_phase mtp_layout env CONFIG="$CONFIG" ALIAS="$FOUNDATION_ALIAS" bash "$SCRIPT_DIR/inspect_stage10_mtp_layout.sh"
 
   if [[ ! -f "$MTP_SRC/r2-meta/stage10-modern-mtp-base.txt" ]]; then
@@ -258,8 +248,6 @@ if phase_enabled topk; then
   esac
 fi
 
-# Final integrity checks. We only verify that the production alias still exists;
-# candidate helpers must never rename or replace it.
 require_alias "$PROD_ALIAS"
 sha256sum "$CONFIG" > "$RUN_DIR/config-after.sha256"
 cp -a "$CONFIG" "$RUN_DIR/config-after.yaml"
