@@ -30,8 +30,12 @@ JMAX must remain byte-for-byte inherited from production, use:
 MTP sweep aliases can override only the existing production argument with:
   --spec-draft-n-max N
 
-The MTP option must already exist in the cloned production block. The script will
-not invent a speculative-decoding command line for a model that does not have one.
+FR-Spec experiments can point the cloned alias at a different draft sidecar with:
+  --draft-model /path/to/draft.gguf
+
+The draft override only replaces an already-existing draft-model CLI option
+(--spec-draft-model, --model-draft, --draft-model, or -md). It refuses to invent
+a speculative setup if the source alias does not already contain exactly one.
 """
 from __future__ import annotations
 
@@ -98,6 +102,26 @@ def replace_existing_cli_option(block: str, option: str, value: str) -> str:
     return pat.sub(lambda m: m.group(1) + value, block, count=1)
 
 
+def replace_draft_model(block: str, value: str) -> tuple[str, str]:
+    # Match only a real CLI token, not a similarly named env/comment. Long forms
+    # come first so '-md' cannot consume a prefix of something else.
+    opts = r"(?:--spec-draft-model|--model-draft|--draft-model|-md)"
+    pat = re.compile(rf"(?P<prefix>(?<!\S){opts}\s+)(?P<value>\"[^\"]*\"|'[^']*'|\S+)")
+    matches = list(pat.finditer(block))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected exactly one existing draft-model option in cloned block, found {len(matches)}; "
+            "refusing to invent or ambiguously edit speculative configuration"
+        )
+    old = matches[0].group("value")
+    quote = old[0] if len(old) >= 2 and old[0] in ('\"', "'") and old[-1] == old[0] else ""
+    if not quote and re.search(r"\s", value):
+        raise RuntimeError("unquoted draft-model path may not contain whitespace")
+    new_value = f"{quote}{value}{quote}" if quote else value
+    block = pat.sub(lambda m: m.group("prefix") + new_value, block, count=1)
+    return block, old.strip("\"'")
+
+
 def inject_env(block: str, indent: int, key: str, value: str) -> str:
     env_pat = re.compile(rf'(?m)^(\s*)-\s*["\']?{re.escape(key)}=[^\n"\']*["\']?\s*$')
     if env_pat.search(block):
@@ -149,6 +173,7 @@ def main() -> int:
     ap.add_argument("--env", action="append", default=[], help="extra KEY=VALUE override; repeatable")
     ap.add_argument("--unset-env", action="append", default=[], help="remove inherited KEY from cloned env block; repeatable")
     ap.add_argument("--spec-draft-n-max", type=int, default=None, help="replace existing --spec-draft-n-max value")
+    ap.add_argument("--draft-model", default=None, help="replace the existing speculative draft GGUF path")
     ap.add_argument("--replace", action="store_true")
     ap.add_argument("--validate", action="store_true", help="run llama-swap -validate after writing")
     args = ap.parse_args()
@@ -159,6 +184,10 @@ def main() -> int:
 
     if args.jmax.lower() != "keep" and not re.fullmatch(r"-?\d+", args.jmax):
         print("ERROR: --jmax must be an integer or 'keep'", file=sys.stderr)
+        return 1
+
+    if args.draft_model is not None and not args.draft_model.strip():
+        print("ERROR: --draft-model may not be empty", file=sys.stderr)
         return 1
 
     try:
@@ -199,10 +228,13 @@ def main() -> int:
         flags=re.M,
     )
 
+    old_draft = None
     try:
         block, old_server = replace_runtime(block, args.r2_bin)
         if args.spec_draft_n_max is not None:
             block = replace_existing_cli_option(block, "--spec-draft-n-max", str(args.spec_draft_n_max))
+        if args.draft_model is not None:
+            block, old_draft = replace_draft_model(block, args.draft_model)
     except RuntimeError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 5
@@ -243,6 +275,8 @@ def main() -> int:
         print(f"OK JMAX={args.jmax}")
     if args.spec_draft_n_max is not None:
         print(f"OK --spec-draft-n-max={args.spec_draft_n_max}")
+    if args.draft_model is not None:
+        print(f"OK draft_model {old_draft} -> {args.draft_model}")
     for key in unset_env:
         print(f"OK unset env {key} removed_entries={removed[key]}")
     for key, value in extra_env:
