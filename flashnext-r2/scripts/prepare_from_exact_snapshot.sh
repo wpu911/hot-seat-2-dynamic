@@ -12,6 +12,7 @@ set -euo pipefail
 #   bash flashnext-r2/scripts/prepare_from_exact_snapshot.sh 4
 #   bash flashnext-r2/scripts/prepare_from_exact_snapshot.sh 7
 #   bash flashnext-r2/scripts/prepare_from_exact_snapshot.sh 8
+#   bash flashnext-r2/scripts/prepare_from_exact_snapshot.sh 9
 #
 # Reuse a previously frozen snapshot:
 #   EXACT_PROD_SRC=/app/share/.../prod-exact-... bash ... 7
@@ -27,8 +28,9 @@ case "$STAGE" in
   4) PREP="$SCRIPT_DIR/prepare_stage4_q8dedup.sh" ;;
   7) PREP="$SCRIPT_DIR/prepare_stage7_qsa_gather.sh" ;;
   8) PREP="$SCRIPT_DIR/prepare_stage8_qsa_pooled_cache.sh" ;;
+  9) PREP="$SCRIPT_DIR/prepare_stage9_lazy_direct.sh" ;;
   *)
-    echo "Usage: $0 {1|2|3|4|7|8}" >&2
+    echo "Usage: $0 {1|2|3|4|7|8|9}" >&2
     echo "Stages 5/6 are alias/runtime sweeps and do not create a new source worktree." >&2
     exit 2
     ;;
