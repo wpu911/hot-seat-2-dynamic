@@ -33,13 +33,37 @@ HC_COMMITS=(
 )
 
 # PR #28243 current GitHub base/head as of 2026-09-18 21:47 CST.
-# Use the current PR base, not the first historical parent. The branch merged
-# newer master; using the old parent would smuggle unrelated master changes into
-# an experiment that is supposed to measure one feature.
+# GitHub compare confirms: status=ahead, behind_by=0, total_commits=12.
+# Use this exact base/head delta. Do NOT diff from the first historical parent:
+# the PR branch later merged newer master, which would drag unrelated upstream
+# changes into the benchmark.
+MTP_REPO="https://github.com/danielhanchen/llama.cpp.git"
 MTP_BASE="911f6cdc8ab8a530b2bee09ee61471a6f3178eeb"
 MTP_HEAD="53b1389d0bf98fa367e2a0ce0475008e762ebf28"
-MTP_PATCH="$PATCH_DIR/pr28243-delta-${MTP_BASE:0:8}-${MTP_HEAD:0:8}.patch"
-MTP_PATCH_URL="https://github.com/danielhanchen/llama.cpp/compare/${MTP_BASE}...${MTP_HEAD}.patch"
+MTP_COMMITS_EXPECTED=12
+MTP_DIFF="$PATCH_DIR/pr28243-delta-${MTP_BASE:0:8}-${MTP_HEAD:0:8}.diff"
+
+EXPECTED_MTP_FILES=(
+  common/speculative.cpp
+  conversion/bailingmoe3.py
+  conversion/base.py
+  conversion/command_r.py
+  conversion/dots3.py
+  conversion/glm.py
+  conversion/qwen.py
+  conversion/qwen4exp.py
+  convert_hf_to_gguf.py
+  gguf-py/gguf/constants.py
+  gguf-py/gguf/tensor_mapping.py
+  src/llama-arch.cpp
+  src/llama-arch.h
+  src/llama-context.cpp
+  src/llama-model-loader.h
+  src/llama-model.cpp
+  src/llama-model.h
+  src/models/models.h
+  src/models/qwen4exp.cpp
+)
 
 if [[ ! -e "$PROD_SRC/.git" ]]; then
   echo "ERROR: PROD_SRC is not a git tree: $PROD_SRC" >&2
@@ -91,37 +115,17 @@ for c in "${HC_COMMITS[@]}"; do
   HC_PATCHES+=("$p")
 done
 
-if [[ ! -f "$MTP_PATCH" ]]; then
-  curl -fL --retry 3 --connect-timeout 20 "$MTP_PATCH_URL" -o "$MTP_PATCH"
-fi
-if ! grep -qi "${MTP_HEAD:0:12}" "$MTP_PATCH"; then
-  echo "ERROR: MTP patch does not contain pinned head $MTP_HEAD" >&2
-  exit 9
-fi
-
 echo "Exact production : $PROD_SRC"
 echo "Exact HEAD       : $(git -C "$PROD_SRC" rev-parse HEAD)"
 echo "HC baseline alias: $HC_BASELINE_ALIAS"
 echo "MTP PR delta     : $MTP_BASE..$MTP_HEAD"
 echo "Candidate tree   : $R2_SRC"
 echo "Candidate runtime: $RUNTIME"
-for p in "${HC_PATCHES[@]}" "$MTP_PATCH"; do sha256sum "$p"; done
+for p in "${HC_PATCHES[@]}"; do sha256sum "$p"; done
 
 git -C "$PROD_SRC" worktree add --detach "$R2_SRC" HEAD
 mkdir -p "$R2_SRC/r2-meta"
 R2_BASE_HEAD="$(git -C "$R2_SRC" rev-parse HEAD)"
-{
-  echo "created=$(date -Is)"
-  echo "exact_production_source=$PROD_SRC"
-  echo "exact_production_head=$R2_BASE_HEAD"
-  echo "hc_commits=${HC_COMMITS[*]}"
-  echo "upstream_pr=ggml-org/llama.cpp#28243"
-  echo "pr_base=$MTP_BASE"
-  echo "pr_head=$MTP_HEAD"
-  for p in "${HC_PATCHES[@]}" "$MTP_PATCH"; do
-    echo "patch_sha256=$(sha256sum "$p" | awk '{print $1}') $(basename "$p")"
-  done
-} > "$R2_SRC/r2-meta/stage10-hc-mtp-base.txt"
 
 cd "$R2_SRC"
 apply_mail_patch() {
@@ -143,7 +147,62 @@ for p in "${HC_PATCHES[@]}"; do apply_mail_patch "$p" "Stage-12 upstream HC"; do
 HC_HEAD="$(git rev-parse HEAD)"
 printf '%s\n' "$HC_HEAD" > r2-meta/stage10-hc-baseline-head.txt
 
-apply_mail_patch "$MTP_PATCH" "PR28243 MTP delta"
+# Fetch the pinned PR head as git objects and derive the final base..head delta
+# locally. This is safer than a mutable /pull/28243.patch URL and also handles
+# the branch's merge commit without asking git-am to replay unrelated master.
+echo "=== fetching pinned PR #28243 objects ==="
+git fetch --no-tags "$MTP_REPO" "$MTP_HEAD"
+git cat-file -e "$MTP_HEAD^{commit}"
+git cat-file -e "$MTP_BASE^{commit}" || {
+  echo "ERROR: pinned PR base is not available after fetching head" >&2
+  exit 11
+}
+
+MERGE_BASE="$(git merge-base "$MTP_BASE" "$MTP_HEAD")"
+if [[ "$MERGE_BASE" != "$MTP_BASE" ]]; then
+  echo "ERROR: pinned PR base is not an ancestor of head" >&2
+  echo "merge_base=$MERGE_BASE expected=$MTP_BASE" >&2
+  exit 12
+fi
+MTP_COMMIT_COUNT="$(git rev-list --count "$MTP_BASE..$MTP_HEAD")"
+if [[ "$MTP_COMMIT_COUNT" != "$MTP_COMMITS_EXPECTED" ]]; then
+  echo "ERROR: PR commit count mismatch: got=$MTP_COMMIT_COUNT expected=$MTP_COMMITS_EXPECTED" >&2
+  exit 13
+fi
+
+git diff --binary --full-index "$MTP_BASE" "$MTP_HEAD" > "$MTP_DIFF.tmp"
+mapfile -t ACTUAL_MTP_FILES < <(git diff --name-only "$MTP_BASE" "$MTP_HEAD")
+printf '%s\n' "${ACTUAL_MTP_FILES[@]}" > r2-meta/stage10-mtp-files.txt
+
+# Exact file-set gate. If the PR changes later, this pinned head should not, but
+# this also catches a bad fetch/range before it touches the experiment tree.
+printf '%s\n' "${EXPECTED_MTP_FILES[@]}" | sort > r2-meta/stage10-mtp-files-expected.txt
+printf '%s\n' "${ACTUAL_MTP_FILES[@]}" | sort > r2-meta/stage10-mtp-files-actual.txt
+if ! cmp -s r2-meta/stage10-mtp-files-expected.txt r2-meta/stage10-mtp-files-actual.txt; then
+  echo "ERROR: PR28243 file set differs from the audited 19-file delta" >&2
+  diff -u r2-meta/stage10-mtp-files-expected.txt r2-meta/stage10-mtp-files-actual.txt >&2 || true
+  exit 14
+fi
+mv "$MTP_DIFF.tmp" "$MTP_DIFF"
+MTP_DIFF_SHA="$(sha256sum "$MTP_DIFF" | awk '{print $1}')"
+echo "MTP delta sha256: $MTP_DIFF_SHA"
+
+# Apply only the audited PR delta on top of the same HC baseline. --3way uses the
+# fetched base blobs when our custom HotSeat source has moved nearby code.
+if ! git apply --3way --index "$MTP_DIFF"; then
+  echo >&2
+  echo "ERROR: PR #28243 delta conflicts with exact-production + upstream-HC tree." >&2
+  echo "Production untouched; candidate retained at $R2_SRC" >&2
+  git status --short >&2 || true
+  echo "Resolve by function, preserving HotSeat ownership/Transit/spec gates." >&2
+  exit 15
+fi
+
+git diff --cached --check
+git -c user.name='FlashNext R2 Experiment' \
+    -c user.email='flashnext-r2@local.invalid' \
+    commit -m "r2 stage10: qwen4exp MTP PR28243 delta $MTP_HEAD" >/dev/null
+
 CANDIDATE_HEAD="$(git rev-parse HEAD)"
 printf '%s\n' "$CANDIDATE_HEAD" > r2-meta/stage10-candidate-head.txt
 
@@ -152,16 +211,34 @@ git diff "$R2_BASE_HEAD".."$HC_HEAD" > r2-meta/stage10-hc-only.diff
 git diff "$HC_HEAD"..HEAD > r2-meta/stage10-mtp-only.diff
 git diff "$R2_BASE_HEAD"..HEAD > r2-meta/stage10-full-stack.diff
 
+{
+  echo "created=$(date -Is)"
+  echo "exact_production_source=$PROD_SRC"
+  echo "exact_production_head=$R2_BASE_HEAD"
+  echo "hc_commits=${HC_COMMITS[*]}"
+  echo "hc_head=$HC_HEAD"
+  echo "upstream_pr=ggml-org/llama.cpp#28243"
+  echo "pr_repo=$MTP_REPO"
+  echo "pr_base=$MTP_BASE"
+  echo "pr_head=$MTP_HEAD"
+  echo "pr_commit_count=$MTP_COMMIT_COUNT"
+  echo "mtp_diff_sha256=$MTP_DIFF_SHA"
+  echo "candidate_head=$CANDIDATE_HEAD"
+  for p in "${HC_PATCHES[@]}"; do
+    echo "hc_patch_sha256=$(sha256sum "$p" | awk '{print $1}') $(basename "$p")"
+  done
+} > r2-meta/stage10-hc-mtp-base.txt
+
 # Required MTP features.
 grep -Rni 'qwen4exp_shared_model' src/models/qwen4exp.cpp | tee r2-meta/mtp-shared-model-probe.txt
 grep -RniE 'n_layer_nextn|LLM_GRAPH_TYPE_DECODER_MTP|QWEN4EXP MTP' src common \
   | head -n 220 | tee r2-meta/mtp-runtime-probes.txt
 
 grep -q 'qwen4exp_shared_model' src/models/qwen4exp.cpp || {
-  echo "ERROR: shared target-module path missing" >&2; exit 11;
+  echo "ERROR: shared target-module path missing" >&2; exit 16;
 }
 grep -q 'LLM_GRAPH_TYPE_DECODER_MTP' src/models/qwen4exp.cpp || {
-  echo "ERROR: qwen4exp MTP graph missing" >&2; exit 12;
+  echo "ERROR: qwen4exp MTP graph missing" >&2; exit 17;
 }
 
 # Critical correctness commit d1a92352: qwen4exp borrows embeddings through
@@ -169,14 +246,14 @@ grep -q 'LLM_GRAPH_TYPE_DECODER_MTP' src/models/qwen4exp.cpp || {
 # Without this, draft catch-up/rollback is skipped and M-RoPE positions can repeat.
 if ! grep -q 'gemma4-assistant' common/speculative.cpp; then
   echo "ERROR: qwen4exp MTP memory-sharing correctness guard missing" >&2
-  exit 13
+  exit 18
 fi
 
-# Confirm Stage-12 HC features are present too, so the baseline/candidate lineage
-# is genuinely the same below the MTP delta.
+# Confirm Stage-12 HC features are present too, so baseline/candidate lineage is
+# genuinely the same below the MTP delta.
 if ! grep -Rq 'ggml_dsv4_hc_pre_gated' ggml src; then
   echo "ERROR: Stage-12 HC baseline feature missing in Stage-10 stack" >&2
-  exit 14
+  exit 19
 fi
 
 if [[ -z "${ROCM_PATH:-}" ]]; then
@@ -203,8 +280,6 @@ cmake --build "$BUILD" -j"${JOBS:-$(nproc)}" --target llama-server test-backend-
 
 test -x "$BUILD/bin/llama-server" || { echo "ERROR: llama-server missing" >&2; exit 20; }
 
-# Targeted generic backend sanity. Architecture-specific numerical checks happen
-# through the real model A/B below.
 if [[ -x "$BUILD/bin/test-backend-ops" ]]; then
   "$BUILD/bin/test-backend-ops" test -o DSV4_HC -b ROCm0 \
     || "$BUILD/bin/test-backend-ops" test -o DSV4_HC -b HIP0 \
