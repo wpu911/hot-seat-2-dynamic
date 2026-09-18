@@ -26,8 +26,8 @@ bash flashnext-r2/scripts/inspect_stage10_mtp_layout.sh
 
 目的：
 
-- 确认 2026-08-31 已合并的 ROCm 长行 radix TOP_K 真正在生产源码中；
-- 确认 2026-09-01 已合并的 n-gram position index 已存在，不重复移植旧 #27992；
+- 确认 ROCm 长行 radix TOP_K 真正在生产源码中；
+- 确认已经合并的 n-gram position index 存在，不重复移植旧 #27992；
 - 确认当前 MTP draft GGUF 是否能被新版 #28243 直接加载。
 
 ---
@@ -60,21 +60,76 @@ bash flashnext-r2/scripts/run_stage12_upstream_hc_ab.sh
 
 ## 3. 第二优先：Stage 10 新版 Qwen3.8 Flash Next MTP
 
-前提：`inspect_stage10_mtp_layout.sh` 判定当前 draft 为兼容候选，或者已经重新生成兼容 #28243 的 draft GGUF。
+前提：
+
+1. Stage 12 已经完成并保留 HC-only alias：
+   `qwen3.8-flash-next-r2-upstream-hc:256k`；
+2. `inspect_stage10_mtp_layout.sh` 判定当前 draft 为兼容候选，或者已经重新生成兼容 #28243 的 draft GGUF。
+
+准备：
 
 ```bash
 bash flashnext-r2/scripts/with_exact_prod.sh \
   flashnext-r2/scripts/prepare_stage10_upstream_mtp.sh
+```
 
+Stage 10 的候选树不是“生产 + MTP”，而是：
+
+```text
+exact production
++ 与 Stage 12 完全相同的官方 HC commits
++ PR #28243 MTP delta
+```
+
+测试时比较：
+
+```text
+Stage 12 HC-only
+vs
+Stage 12 HC + PR #28243 MTP
+```
+
+这样 HC 不再是隐藏变量，真正只测 MTP。PR #28243 当前 pin：
+
+```text
+base 911f6cdc8ab8a530b2bee09ee61471a6f3178eeb
+head 53b1389d0bf98fa367e2a0ce0475008e762ebf28
+```
+
+不要再从历史首个 parent 生成 compare patch。该分支后来 merge 了新版 master，从旧 parent 拉 patch 会把无关 upstream 更新一起塞进实验。
+
+测试：
+
+```bash
 bash flashnext-r2/scripts/run_stage10_mtp_ab.sh
 ```
+
+该脚本现在包含两层 Gate：
+
+```text
+普通 cache_prompt=false A/B
++
+cached Large-PP / high-LCP branch regression
+```
+
+第二层专门防止 2026-09-11 出现过的：
+
+```text
+cached Large-PP
+→ Borrow / Transit 驻留结构变化
+→ MTP multi-row verification 大量落 CPU
+→ TG 约 0.1 t/s
+```
+
+另外必须保留 PR #28243 中 `d1a92352` 的正确性修复：Qwen4Exp draft 可以通过 `ctx_other` 借 target embedding / LM head，但**不共享 target KV/recurrent memory**。只有 `gemma4-assistant` 走 memory-shared 判定。否则 draft catch-up / rollback 会被跳过，M-RoPE position 会出问题。
 
 本 Stage：
 
 - 不改 JMAX；
 - 不改 `--spec-draft-n-max`；
 - 不改 HotSeat env；
-- 只比较现有 MTP 实现和 #28243 路线。
+- baseline 与 candidate 使用相同官方 HC；
+- 只比较现有 MTP 与 #28243 MTP 差异。
 
 先确认新版 MTP 本体收益，再进入 MTP2/3/4 sweep。
 
@@ -200,7 +255,7 @@ GGML_USE_HIP -> sparse FA return false / abort
 
 ```text
 官方 HC (#28896/#28901)  vs JohnTDI HC     二选一后再组合
-新版 MTP (#28243)         vs 当前自定义 MTP 先独立比较
+新版 MTP (#28243)         在官方 HC 相同基线上与旧 MTP 比较
 QSA gather + pooled cache                    可以按顺序叠加
 lazy direct PLE                              与 TG kernel 优化正交，但需单独确认 PP 收益
 ```
