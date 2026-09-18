@@ -1,102 +1,131 @@
-# Flash Next R2 下一轮执行顺序（2026-09-18）
+# Flash Next R2 当前执行顺序（2026-09-18）
 
-## 0. 先锁死基线
-
-生产源码允许存在未提交的 HotSeat 修改，因此以后所有需要重新编译的 Stage 必须通过：
-
-```bash
-bash flashnext-r2/scripts/with_exact_prod.sh <prepare-script>
-```
-
-`with_exact_prod.sh` 会先调用 `create_exact_prod_snapshot_repo.sh`，把当前生产 working tree（包括有意保留的 tracked/untracked HotSeat 源码修改）冻结成一个 clean git snapshot，再从该 snapshot 做实验。
-
-**禁止直接拿生产目录的 `HEAD` 建 worktree 做 A/B。** 否则会悄悄漏掉本地 HotSeat 修改。
+> 本文件取代早期“Sep11 + 单独挑几个 patch”的路线。现在的主线是：**先把生产自定义层完整前移到 Sep18 upstream foundation，再在同一个现代基线上逐项 A/B。**
 
 ---
 
-## 1. 零成本验证
+## 0. 不动生产
 
-先跑，不编译：
+正式 alias 继续保持：
 
-```bash
-bash flashnext-r2/scripts/verify_stage7_rocm_topk.sh
-bash flashnext-r2/scripts/verify_stage9_ngram_index.sh
-bash flashnext-r2/scripts/inspect_stage10_mtp_layout.sh
+```text
+qwen3.8-flash-next:256k
 ```
 
-目的：
+正式 runtime 在所有实验完成前不覆盖。
 
-- 确认 ROCm 长行 radix TOP_K 真正在生产源码中；
-- 确认已经合并的 n-gram position index 存在，不重复移植旧 #27992；
-- 确认当前 MTP draft GGUF 是否能被新版 #28243 直接加载。
+所有实验通过 llama-swap `127.0.0.1:8090` 跑，模型切换只使用单模型 unload，不使用全局 unload。
+
+生产源码存在有意保留的 HotSeat / Dynamic KV / cached Large-PP 等本地修改，因此实验基线必须先冻结 exact production snapshot，禁止直接拿 live tree 的 `HEAD` 冒充生产。
 
 ---
 
-## 2. 第一优先：Stage 12 官方 HC / RMSNorm 图优化
+## 1. 先建立 Modern Foundation
 
-生产基线是 2026-09-11，官方以下两项在生产基线之后合并：
+生产官方底座记录为：
 
-- #28896：qwen4exp rms_norm + mul fusion graph refactor；
-- #28901：qwen4exp HC fused ops。
+```text
+Sep11 upstream = b0dcb8192b201e402ec3eff524e55450f8070e3e
+```
+
+PR #28243 当前依赖的 Sep18 upstream base：
+
+```text
+911f6cdc8ab8a530b2bee09ee61471a6f3178eeb
+```
+
+两者之间已经隔了大量 upstream 变化。因此不再采用：
+
+```text
+Sep11 production
++ HC patch
++ MTP patch
++ 若干零散 commit
+```
+
+而改成：
+
+```text
+Sep11 official base
+        +
+exact production custom overlay
+        ↓ 提取用户自定义层
+
+Sep18 official base 911f6cdc
+        +
+同一份 exact production custom overlay
+        ↓
+Modern Foundation
+```
 
 准备：
 
 ```bash
-bash flashnext-r2/scripts/with_exact_prod.sh \
-  flashnext-r2/scripts/prepare_stage12_upstream_hc.sh
+bash flashnext-r2/scripts/create_exact_prod_snapshot_repo.sh
+bash flashnext-r2/scripts/prepare_modern_foundation.sh
 ```
 
-测试：
-
-```bash
-bash flashnext-r2/scripts/run_stage12_upstream_hc_ab.sh
-```
-
-原因：它已经进入 upstream，改动比自定义 HC fork 更容易长期维护，而且同时有 PP/TG 收益潜力。
-
-如果官方 Stage 12 通过，再与 Stage 2 JohnTDI HC 做直接比较，不把两套 HC 同时叠加。
-
----
-
-## 3. 第二优先：Stage 10 新版 Qwen3.8 Flash Next MTP
-
-前提：
-
-1. Stage 12 已经完成并保留 HC-only alias：
-   `qwen3.8-flash-next-r2-upstream-hc:256k`；
-2. `inspect_stage10_mtp_layout.sh` 判定当前 draft 为兼容候选，或者已经重新生成兼容 #28243 的 draft GGUF。
-
-准备：
-
-```bash
-bash flashnext-r2/scripts/with_exact_prod.sh \
-  flashnext-r2/scripts/prepare_stage10_upstream_mtp.sh
-```
-
-Stage 10 的候选树不是“生产 + MTP”，而是：
+生成：
 
 ```text
-exact production
-+ 与 Stage 12 完全相同的官方 HC commits
-+ PR #28243 MTP delta
+source:
+/app/share/llama_box/src/llama.cpp-flashnext-modern-foundation-20260918
+
+runtime:
+/app/share/llm/Qwen3.8-Flash-Next-GGUF/runtime-text/r2-modern-foundation
+
+alias:
+qwen3.8-flash-next-r2-modern-foundation:256k
 ```
 
-测试时比较：
+A/B：
+
+```bash
+bash flashnext-r2/scripts/run_modern_foundation_ab.sh
+```
+
+Gate：
 
 ```text
-Stage 12 HC-only
+production Sep11 custom engine
 vs
-Stage 12 HC + PR #28243 MTP
+Sep18 upstream + exact same production custom overlay
 ```
 
-这样 HC 不再是隐藏变量，真正只测 MTP。PR #28243 当前 pin：
+只有 Modern Foundation 本身通过后，后续 Stage 才有意义。
+
+---
+
+## 2. Stage 10：新版 Qwen3.8 Flash Next MTP #28243
+
+当前 pin：
 
 ```text
-base 911f6cdc8ab8a530b2bee09ee61471a6f3178eeb
-head 53b1389d0bf98fa367e2a0ce0475008e762ebf28
+PR:   ggml-org/llama.cpp#28243
+base: 911f6cdc8ab8a530b2bee09ee61471a6f3178eeb
+head: 53b1389d0bf98fa367e2a0ce0475008e762ebf28
+commits: 12
+files: 19
 ```
 
-不要再从历史首个 parent 生成 compare patch。该分支后来 merge 了新版 master，从旧 parent 拉 patch 会把无关 upstream 更新一起塞进实验。
+Stage 10 不是再从 Sep11 源码硬套 patch，而是在 **Modern Foundation** 上仅叠加 `base..head` 的 PR28243 delta。
+
+准备：
+
+```bash
+bash flashnext-r2/scripts/inspect_stage10_mtp_layout.sh
+bash flashnext-r2/scripts/prepare_stage10_upstream_mtp.sh
+```
+
+生成：
+
+```text
+baseline:
+qwen3.8-flash-next-r2-modern-foundation:256k
+
+candidate:
+qwen3.8-flash-next-r2-modern-mtp:256k
+```
 
 测试：
 
@@ -104,160 +133,241 @@ head 53b1389d0bf98fa367e2a0ce0475008e762ebf28
 bash flashnext-r2/scripts/run_stage10_mtp_ab.sh
 ```
 
-该脚本现在包含两层 Gate：
+必须同时通过：
 
 ```text
-普通 cache_prompt=false A/B
-+
-cached Large-PP / high-LCP branch regression
+普通 PP/TG A/B
+MTP acceptance
+确定性输出
+cached Large-PP / high-LCP 分叉回归
+MTP catch-up / rollback
 ```
 
-第二层专门防止 2026-09-11 出现过的：
-
-```text
-cached Large-PP
-→ Borrow / Transit 驻留结构变化
-→ MTP multi-row verification 大量落 CPU
-→ TG 约 0.1 t/s
-```
-
-另外必须保留 PR #28243 中 `d1a92352` 的正确性修复：Qwen4Exp draft 可以通过 `ctx_other` 借 target embedding / LM head，但**不共享 target KV/recurrent memory**。只有 `gemma4-assistant` 走 memory-shared 判定。否则 draft catch-up / rollback 会被跳过，M-RoPE position 会出问题。
-
-本 Stage：
-
-- 不改 JMAX；
-- 不改 `--spec-draft-n-max`；
-- 不改 HotSeat env；
-- baseline 与 candidate 使用相同官方 HC；
-- 只比较现有 MTP 与 #28243 MTP 差异。
-
-先确认新版 MTP 本体收益，再进入 MTP2/3/4 sweep。
+特别保留 PR28243 的 memory-sharing 正确性修复：Qwen4Exp draft 可借 target embedding / LM head，但不共享 target KV / recurrent memory。不能因为存在 `ctx_other` 就跳过 draft catch-up / rollback。
 
 ---
 
-## 4. 第三优先：Stage 11 PLE lazy direct read
+## 3. Stage 14：ROCm TOP_K #28313
 
-#29030 针对 qwen4exp 巨型 PLE 表，把 mmap demand-fault 行读取改成：
+当前 AMD 长上下文 QSA 的 TOP_K 路径仍值得单独优化。PR #28313：
 
 ```text
-整批索引
-→ 去重
-→ 按文件位置排序
-→ 多线程 positional read
-→ staging
+ROCm: resolve TOP_K kernels
+head: 93ceb53397b8885c55533bd680f6ff430418317e
+changed files: 1
+  ggml/src/ggml-cuda/top-k.cu
 ```
+
+该 PR 对 HIP TOP_K 增加/重排了 small-case、n-ary 和专用选择路径。上游 microbenchmark 在多种 shape 上报告明显降低 kernel 时间，但是否能转化成这台 `gfx1100 + gfx1201` 的 Flash Next TG 提升，必须本机端到端验证。
 
 准备：
 
 ```bash
-bash flashnext-r2/scripts/with_exact_prod.sh \
-  flashnext-r2/scripts/prepare_stage11_lazy_direct.sh
+bash flashnext-r2/scripts/prepare_stage14_rocm_topk.sh
+```
+
+Stage 14 会注册四个 alias：
+
+```text
+HIP graphs ON:
+qwen3.8-flash-next-r2-modern-mtp:256k
+qwen3.8-flash-next-r2-rocm-topk:256k
+
+HIP graphs OFF:
+qwen3.8-flash-next-r2-topk-base-nograph:256k
+qwen3.8-flash-next-r2-topk-nograph:256k
 ```
 
 测试：
 
 ```bash
-bash flashnext-r2/scripts/run_stage11_lazy_direct_ab.sh
+bash flashnext-r2/scripts/run_stage14_rocm_topk_ab.sh
 ```
 
-两个 alias 使用相同真实 ELF，只通过 wrapper 强制：
+长上下文 ladder 默认：
 
 ```text
---lazy-mode on
-vs
---lazy-mode on-direct
+16K
+32K
+64K
+128K
 ```
 
-主要观察 PP。TG 不允许明显回退。
+每个深度不仅测 TG，还必须通过 needle retrieval，避免 TOP_K 跑快了却选错 QSA cell。
 
-如果生产 alias 显式使用 `--no-mmap`，prepare 会主动停止，不做伪 A/B。
+Stage 14 有三个结论：
+
+```text
+PASS
+  graphs ON 的正常生产路径有安全的实质提升
+
+HIP_GRAPH_INTERACTION
+  graphs OFF 明显变快，但 graphs ON 没吃到收益
+  此时先查 HIP Graph，不直接否定 TOP_K kernel
+
+FAIL
+  无实质提升或出现检索 / acceptance / PP 回退
+```
+
+之所以同时测 graph ON/OFF，是因为 #28313 上游 benchmark 明确关闭了 HIP graphs，且提到 ROCm graph update 存在问题。不能拿 graph-off 微基准直接宣布生产提速。
+
+另外，PR 讨论中曾争论 RDNA wave64，作者随后表示回退到安全 wave32 路线。当前实验只跟随 pin 的 PR head，不自行添加 wave64 魔改。
 
 ---
 
-## 5. 第四优先：Stage 7 / 8 长上下文 QSA
+## 4. Stage 13：FR-Spec
 
-### Stage 7：QSA gather
+新版 MTP 通过后，再缩 speculative draft vocabulary，不提前把 FR-Spec 和 MTP runtime 改动混在一起。
+
+准备：
 
 ```bash
-bash flashnext-r2/scripts/with_exact_prod.sh \
-  flashnext-r2/scripts/prepare_stage7_qsa_gather.sh
+bash flashnext-r2/scripts/prepare_stage13_frspec_modern.sh
+```
 
+比较：
+
+```text
+qwen3.8-flash-next-r2-modern-frspec-full:256k
+vs
+qwen3.8-flash-next-r2-modern-frspec-65k:256k
+```
+
+测试：
+
+```bash
+bash flashnext-r2/scripts/run_stage13_frspec_modern_ab.sh
+```
+
+重点：
+
+```text
+TG
+MTP acceptance
+输出一致性
+sidecar RAM/VRAM
+cached Large-PP
+```
+
+如果 65K vocabulary 造成 acceptance 明显下降，不因为单次 TG 好看就保留。
+
+---
+
+## 5. PLE Direct Read
+
+Flash Next 的 PLE 大表读取仍作为 PP 专项优化保留。
+
+```bash
+bash flashnext-r2/scripts/prepare_stage11_lazy_direct.sh
+bash flashnext-r2/scripts/run_stage11_lazy_direct_ab.sh
+```
+
+主要看：
+
+```text
+PP
+page fault / I/O 行为
+TG 不回退
+```
+
+如果当前生产模型路径显式依赖 `--no-mmap`，不得制造一个不成立的 on vs on-direct A/B。
+
+---
+
+## 6. QSA Gather + Incremental Pooled-Key Cache
+
+### QSA gather
+
+```bash
+bash flashnext-r2/scripts/prepare_stage7_qsa_gather.sh
 bash flashnext-r2/scripts/run_stage7_qsa_gather_ab.sh
 ```
 
-### Stage 8：incremental pooled-key cache
+### pooled-key incremental cache
 
 ```bash
-bash flashnext-r2/scripts/with_exact_prod.sh \
-  flashnext-r2/scripts/prepare_stage8_qsa_pooled.sh
-
+bash flashnext-r2/scripts/prepare_stage8_qsa_pooled.sh
 bash flashnext-r2/scripts/run_stage8_qsa_pooled_ab.sh
 python3 flashnext-r2/scripts/bench_stage8_rollback_stress.py
 ```
 
-Stage 8 必须额外通过 MTP / rollback stress，不能只看吞吐。
+最终组合时，Stage 14 TOP_K winner 应作为 QSA 基础层，再叠加 gather / pooled cache 重跑完整 ladder。
+
+不能只看 4K/16K。真正关注：
+
+```text
+32K
+64K
+128K
+cached branch
+rollback
+checkpoint/state restore
+```
 
 ---
 
-## 6. 之后才做参数扫
+## 7. 最后才扫参数
 
-只有前面的代码路径稳定后再扫：
+代码路径确定后再扫：
 
 ```text
-JMAX 16 / 32 / 64
 MTP n-max 2 / 3 / 4
+JMAX 16 / 32 / 64
 HIP Graph ON/OFF
 Q8 activation dedup
 GDN fusion
+JohnTDI 特有 RDNA4 kernel（只在 gfx1201 路径上）
 ```
 
-避免同时改变多个变量后再猜是谁提速。
+`gfx1201` 专用优化不能默认套给 `gfx1100`。双卡异构环境必须分别验证。
 
 ---
 
-## 7. 明确跳过的路线
-
-### CUDA sparse FA #28770
-
-当前实现源码明确：
+## 8. 明确不走的路线
 
 ```text
-GGML_USE_HIP -> sparse FA return false / abort
+CUDA sparse FA #28770
+  当前实现仍是 NVIDIA CUDA 路线，HIP 不直接套。
+
+旧 n-gram #27992
+  若 seq_pos_tok_le() 已在 modern foundation，则不重复移植。
+
+多 stream fork/join
+  以前 ROCm 实测同步代价过高，不进当前主线。
+
+wave64 强开
+  #28313 讨论已暴露维护/兼容风险，本轮只测安全的 pinned PR head。
 ```
-
-因此现在不把 NVIDIA-only sparse FA 移植到 ROCm 生产实验。AMD 长上下文优先使用 Stage 7 QSA gather + Stage 8 pooled-key cache。
-
-### 旧 n-gram #27992
-
-若 Stage 9 确认 `seq_pos_tok_le()` 已存在，则不再移植旧 #27992。官方后续实现已把历史 token 查找改成 per-sequence position index。
-
-### 多 stream fork/join
-
-此前 ROCm 实测同步成本过高，不列入当前主线。
 
 ---
 
-## 8. 最终合并原则
+## 9. 最终组合顺序
 
-最终 production R2 不是“把所有 patch 堆一起”。正确过程：
-
-```text
-每个 Stage 独立 A/B
-→ 通过 Gate
-→ 检查彼此是否重叠/替代
-→ 只保留 winner
-→ 从 exact production snapshot 重建 clean combined tree
-→ 重新跑短上下文 + 长上下文 + cached Large-PP + rollback/MTP 回归
-→ 最后才切 qwen3.8-flash-next:256k 的 runtime
-```
-
-重点组合关系：
+不是把所有 PASS 的 patch 一股脑堆上去。最终 clean runtime 应按：
 
 ```text
-官方 HC (#28896/#28901)  vs JohnTDI HC     二选一后再组合
-新版 MTP (#28243)         在官方 HC 相同基线上与旧 MTP 比较
-QSA gather + pooled cache                    可以按顺序叠加
-lazy direct PLE                              与 TG kernel 优化正交，但需单独确认 PP 收益
+Modern Foundation
+    ↓
+MTP winner
+    ↓
+ROCm TOP_K winner
+    ↓
+FR-Spec winner（如果成立）
+    ↓
+PLE winner
+    ↓
+QSA gather
+    ↓
+pooled-key cache
+    ↓
+MTP/JMAX/Graph 参数 sweep
+    ↓
+short + 32K + 64K + 128K
++ cached Large-PP
++ rollback/checkpoint
++ OpenClaw real path regression
+    ↓
+最后才切生产 qwen3.8-flash-next:256k
 ```
 
-生产 alias、生产 runtime 在所有实验完成前保持不变。
+任何单项如果只是微基准更快、但 llama-swap 真实路径无收益，就不进入最终 runtime。毕竟我们优化的是模型，不是 benchmark 截图收藏夹。
