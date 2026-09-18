@@ -16,6 +16,7 @@ PROD_SRC="${PROD_SRC:-/app/share/llama_box/src/llama.cpp-latest-hotseat-prod-202
 SNAP_ROOT="${SNAP_ROOT:-/app/share/llama_box/src/llama.cpp-prod-exact-snapshots}"
 STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
 SNAP="${SNAP:-$SNAP_ROOT/prod-exact-$STAMP}"
+CURRENT_LINK="${CURRENT_LINK:-$SNAP_ROOT/current}"
 
 if [[ ! -e "$PROD_SRC/.git" ]]; then
   echo "ERROR: not a git worktree: $PROD_SRC" >&2
@@ -90,7 +91,6 @@ SNAP_HEAD="$(git -C "$SNAP" rev-parse HEAD)"
 # Verify every path modified relative to the original HEAD byte-for-byte against
 # the live production tree. This includes newly added source files.
 mapfile -t CHANGED < <(git -C "$SNAP" diff-tree --no-commit-id --name-only -r "$SNAP_HEAD")
-# The snapshot metadata is intentionally new and does not exist in production.
 for rel in "${CHANGED[@]}"; do
   [[ "$rel" == r2-snapshot-meta/* ]] && continue
   if [[ -e "$PROD_SRC/$rel" && -e "$SNAP/$rel" ]]; then
@@ -99,7 +99,7 @@ for rel in "${CHANGED[@]}"; do
       exit 10
     fi
   elif [[ ! -e "$PROD_SRC/$rel" && ! -e "$SNAP/$rel" ]]; then
-    : # deleted in both logical states
+    :
   else
     echo "ERROR: snapshot path existence differs: $rel" >&2
     exit 11
@@ -112,11 +112,29 @@ SNAPSHOT_HEAD=$SNAP_HEAD
 ORIGINAL_PRODUCTION=$PROD_SRC
 ORIGINAL_HEAD=$HEAD_SHA
 
-Use this snapshot as PROD_SRC for Flash Next R2 prepare scripts.
+Use this snapshot as PROD_SRC / EXACT_SRC for Flash Next R2 prepare scripts.
 It contains the original committed HEAD plus the live tracked/untracked source edits.
 EOF
+
+# Stable pointer for downstream scripts. Never replace a real directory named
+# "current" automatically; only create/update a symlink. Relative link keeps the
+# snapshot root relocatable as a unit.
+if [[ -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]]; then
+  echo "ERROR: current snapshot pointer exists and is not a symlink: $CURRENT_LINK" >&2
+  exit 12
+fi
+ln -sfn "$(basename "$SNAP")" "$CURRENT_LINK"
+
+# Verify the pointer resolves to the exact snapshot we just created.
+CURRENT_REAL="$(readlink -f "$CURRENT_LINK")"
+SNAP_REAL="$(readlink -f "$SNAP")"
+[[ "$CURRENT_REAL" == "$SNAP_REAL" ]] || {
+  echo "ERROR: current snapshot pointer mismatch: $CURRENT_REAL != $SNAP_REAL" >&2
+  exit 13
+}
 
 echo
 echo "SNAPSHOT=$SNAP"
 echo "SNAPSHOT_HEAD=$SNAP_HEAD"
+echo "CURRENT=$CURRENT_LINK"
 echo "Snapshot is clean: $(git -C "$SNAP" status --porcelain | wc -l) dirty entries"
