@@ -23,6 +23,10 @@ Additional experiment switches may be supplied repeatedly with:
 Inherited experiment switches may be explicitly removed from the cloned block with:
   --unset-env KEY
 
+JMAX normally defaults to 32 for Stage-1 compatibility. For experiments where
+JMAX must remain byte-for-byte inherited from production, use:
+  --jmax keep
+
 MTP sweep aliases can override only the existing production argument with:
   --spec-draft-n-max N
 
@@ -141,7 +145,7 @@ def main() -> int:
     ap.add_argument("--source-alias", default=SRC_ALIAS)
     ap.add_argument("--alias", default=DST_ALIAS)
     ap.add_argument("--r2-bin", default=R2_BIN)
-    ap.add_argument("--jmax", default="32")
+    ap.add_argument("--jmax", default="32", help="JMAX override, or 'keep' to inherit production unchanged")
     ap.add_argument("--env", action="append", default=[], help="extra KEY=VALUE override; repeatable")
     ap.add_argument("--unset-env", action="append", default=[], help="remove inherited KEY from cloned env block; repeatable")
     ap.add_argument("--spec-draft-n-max", type=int, default=None, help="replace existing --spec-draft-n-max value")
@@ -151,6 +155,10 @@ def main() -> int:
 
     if args.spec_draft_n_max is not None and not (1 <= args.spec_draft_n_max <= 16):
         print("ERROR: --spec-draft-n-max must be in 1..16", file=sys.stderr)
+        return 1
+
+    if args.jmax.lower() != "keep" and not re.fullmatch(r"-?\d+", args.jmax):
+        print("ERROR: --jmax must be an integer or 'keep'", file=sys.stderr)
         return 1
 
     try:
@@ -207,7 +215,8 @@ def main() -> int:
         block, n = remove_env(block, key)
         removed[key] = n
 
-    block = inject_env(block, indent, "GGML_JOHNV8_MMQ_ID_JMAX", args.jmax)
+    if args.jmax.lower() != "keep":
+        block = inject_env(block, indent, "GGML_JOHNV8_MMQ_ID_JMAX", args.jmax)
     for key, value in extra_env:
         block = inject_env(block, indent, key, value)
 
@@ -228,7 +237,10 @@ def main() -> int:
     print(f"OK source_alias={args.source_alias}")
     print(f"OK r2_alias={args.alias}")
     print(f"OK r2_bin={args.r2_bin}")
-    print(f"OK JMAX={args.jmax}")
+    if args.jmax.lower() == "keep":
+        print("OK JMAX=KEEP_FROM_PRODUCTION")
+    else:
+        print(f"OK JMAX={args.jmax}")
     if args.spec_draft_n_max is not None:
         print(f"OK --spec-draft-n-max={args.spec_draft_n_max}")
     for key in unset_env:
