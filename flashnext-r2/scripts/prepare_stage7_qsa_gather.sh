@@ -1,50 +1,67 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Flash Next R2 Stage 7B: QSA gather-based sparse attention for decode.
-# Based on ggml-org/llama.cpp PR #28213, pinned to its current single-commit head.
+# Flash Next R2 QSA gather stage, rebased onto the corrected modern line.
+# Based on ggml-org/llama.cpp PR #28213, pinned to its current one-commit head.
+#
 # The SAME patched binary is exposed through OFF/ON llama-swap aliases so the
 # only variable is QWEN4EXP_QSA_GATHER.
 #
-# Run through with_exact_prod.sh. A raw live production tree may contain
-# intentional uncommitted HotSeat edits and must not be reduced to HEAD.
+# Default base is modern MTP. If Stage-14 ROCm TOP_K is confirmed as a winner,
+# layer it underneath this stage by overriding both variables together:
+#
+#   BASE_SRC=/app/share/llama_box/src/llama.cpp-flashnext-r2-rocm-topk-20260918 \
+#   SOURCE_ALIAS=qwen3.8-flash-next-r2-rocm-topk:256k \
+#   bash prepare_stage7_qsa_gather.sh
+#
+# Never mix a source from one lineage with a llama-swap alias from another.
 
-PROD_SRC="${PROD_SRC:-/app/share/llama_box/src/llama.cpp-latest-hotseat-prod-20260911}"
-R2_SRC="${R2_SRC:-/app/share/llama_box/src/llama.cpp-flashnext-r2-qsa-gather-20260918}"
-RUNTIME="${RUNTIME:-/app/share/llm/Qwen3.8-Flash-Next-GGUF/runtime-text/r2-qsa-gather}"
+BASE_SRC="${BASE_SRC:-/app/share/llama_box/src/llama.cpp-flashnext-r2-modern-mtp-20260918}"
+SOURCE_ALIAS="${SOURCE_ALIAS:-qwen3.8-flash-next-r2-modern-mtp:256k}"
+R2_SRC="${R2_SRC:-/app/share/llama_box/src/llama.cpp-flashnext-r2-modern-qsa-gather-20260918}"
+RUNTIME="${RUNTIME:-/app/share/llm/Qwen3.8-Flash-Next-GGUF/runtime-text/r2-modern-qsa-gather}"
+CONFIG="${CONFIG:-/app/share/llama_box/config/config-rocm714.yaml}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_DIR="${PATCH_DIR:-/app/share/llama_box/src/flashnext-r2-vendor}"
 PATCH="$PATCH_DIR/pr28213-qsa-gather-beed2f78.patch"
 PATCH_URL="https://github.com/abdel-darwish-27/llama.cpp/commit/beed2f78ac42cf16710b763e6f3ba20665c6d233.patch"
 PATCH_HEAD="beed2f78ac42cf16710b763e6f3ba20665c6d233"
 
-OFF_ALIAS="${OFF_ALIAS:-qwen3.8-flash-next-r2-qsa-off:256k}"
-ON_ALIAS="${ON_ALIAS:-qwen3.8-flash-next-r2-qsa-on:256k}"
+OFF_ALIAS="${OFF_ALIAS:-qwen3.8-flash-next-r2-modern-qsa-off:256k}"
+ON_ALIAS="${ON_ALIAS:-qwen3.8-flash-next-r2-modern-qsa-on:256k}"
 
-if [[ ! -e "$PROD_SRC/.git" ]]; then
-  echo "ERROR: production source is not a git worktree: $PROD_SRC" >&2
+if [[ ! -e "$BASE_SRC/.git" ]]; then
+  echo "ERROR: modern base source is not a git worktree/repo: $BASE_SRC" >&2
+  echo "Prepare Modern Foundation + Stage10 MTP first, or override BASE_SRC/SOURCE_ALIAS together." >&2
   exit 2
 fi
-if [[ -n "$(git -C "$PROD_SRC" status --porcelain)" ]]; then
-  echo "ERROR: PROD_SRC is dirty; Stage 7 refuses to benchmark HEAD while dropping live HotSeat edits." >&2
-  echo "Use: bash $SCRIPT_DIR/with_exact_prod.sh $SCRIPT_DIR/prepare_stage7_qsa_gather.sh" >&2
+if [[ -n "$(git -C "$BASE_SRC" status --porcelain --untracked-files=no)" ]]; then
+  echo "ERROR: BASE_SRC has tracked modifications; QSA A/B requires a committed base." >&2
+  git -C "$BASE_SRC" status --short --untracked-files=no >&2 || true
   exit 3
 fi
-if [[ -e "$R2_SRC" ]]; then
-  echo "ERROR: Stage-7 QSA worktree already exists: $R2_SRC" >&2
+if [[ ! -f "$CONFIG" ]]; then
+  echo "ERROR: llama-swap config missing: $CONFIG" >&2
   exit 4
 fi
-if [[ -e "$RUNTIME" ]]; then
-  echo "ERROR: Stage-7 QSA runtime already exists: $RUNTIME" >&2
+if [[ -e "$R2_SRC" || -e "$RUNTIME" ]]; then
+  echo "ERROR: QSA source/runtime already exists; refusing overwrite" >&2
+  echo "source=$R2_SRC runtime=$RUNTIME" >&2
   exit 5
 fi
 
-PROD_HEAD="$(git -C "$PROD_SRC" rev-parse HEAD)"
-echo "Exact production  : $PROD_SRC"
-echo "Production HEAD   : $PROD_HEAD"
-echo "Stage-7 worktree  : $R2_SRC"
-echo "Stage-7 runtime   : $RUNTIME"
-echo "PR28213 head      : $PATCH_HEAD"
+grep -qE "^[[:space:]]*${SOURCE_ALIAS//./\\.}:[[:space:]]*(#.*)?$" "$CONFIG" || {
+  echo "ERROR: SOURCE_ALIAS missing from llama-swap config: $SOURCE_ALIAS" >&2
+  exit 6
+}
+
+BASE_HEAD="$(git -C "$BASE_SRC" rev-parse HEAD)"
+echo "Modern QSA base : $BASE_SRC"
+echo "Base HEAD       : $BASE_HEAD"
+echo "Source alias    : $SOURCE_ALIAS"
+echo "QSA worktree    : $R2_SRC"
+echo "QSA runtime     : $RUNTIME"
+echo "PR28213 head    : $PATCH_HEAD"
 
 mkdir -p "$PATCH_DIR"
 if [[ ! -f "$PATCH" ]]; then
@@ -53,50 +70,65 @@ fi
 if ! head -n 1 "$PATCH" | grep -qi "${PATCH_HEAD:0:12}"; then
   echo "ERROR: downloaded patch does not identify pinned commit $PATCH_HEAD" >&2
   head -n 3 "$PATCH" >&2 || true
-  exit 6
-fi
-
-# Long-context QSA numbers are meaningless if TOP_K falls back to CPU.
-if ! grep -RqiE 'radix.*top.?k|top.?k.*radix|radix_select|top_k_radix' "$PROD_SRC/ggml/src/ggml-cuda"; then
-  echo "ERROR: ROCm long-row radix TOP_K not confirmed in exact production source." >&2
-  echo "Run verify_stage7_rocm_topk.sh first." >&2
   exit 7
 fi
+PATCH_SHA="$(sha256sum "$PATCH" | awk '{print $1}')"
 
-git -C "$PROD_SRC" worktree add --detach "$R2_SRC" "$PROD_HEAD"
+# Long-context QSA numbers are meaningless if TOP_K is not GPU-resident.
+if ! grep -RqiE 'radix.*top.?k|top.?k.*radix|radix_select|top_k_.*radix' "$BASE_SRC/ggml/src/ggml-cuda"; then
+  echo "ERROR: ROCm long-row radix TOP_K not confirmed in selected modern base." >&2
+  exit 8
+fi
+
+git -C "$BASE_SRC" worktree add --detach "$R2_SRC" "$BASE_HEAD"
 mkdir -p "$R2_SRC/r2-meta"
-{
-  echo "created=$(date -Is)"
-  echo "exact_production_source=$PROD_SRC"
-  echo "production_head=$PROD_HEAD"
-  echo "upstream_pr=ggml-org/llama.cpp#28213"
-  echo "patch_head=$PATCH_HEAD"
-  echo "patch_url=$PATCH_URL"
-  echo "patch_sha256=$(sha256sum "$PATCH" | awk '{print $1}')"
-} > "$R2_SRC/r2-meta/stage7-qsa-base.txt"
-
 cd "$R2_SRC"
-if ! git apply --3way "$PATCH"; then
-  echo "ERROR: PR #28213 did not apply cleanly to the exact production HotSeat tree." >&2
-  echo "Worktree is kept for functional migration. Production remains untouched." >&2
+
+# Keep this as a real commit so pooled-cache and final-combination stages can use
+# the QSA-gather winner as a clean base instead of inheriting a dirty tree.
+if ! git -c user.name='FlashNext R2 Experiment' \
+         -c user.email='flashnext-r2@local.invalid' \
+         am --3way "$PATCH"; then
+  echo "ERROR: PR #28213 did not apply cleanly to the selected modern base." >&2
+  echo "Candidate tree retained for semantic merge. Production remains untouched." >&2
   git status --short >&2 || true
   exit 10
 fi
 
-git diff --check
-git diff > r2-meta/stage7-qsa-gather.diff
+git diff --check "$BASE_HEAD"..HEAD
+
+# Make sure the runtime switch and gather graph really landed.
+if ! grep -Rq 'QWEN4EXP_QSA_GATHER' src; then
+  echo "ERROR: QSA gather runtime switch missing after patch." >&2
+  exit 11
+fi
+if ! grep -RqiE 'gather.*qsa|qsa.*gather|ggml_get_rows' src/models/qwen4exp.cpp; then
+  echo "ERROR: QSA gather graph markers missing after patch." >&2
+  exit 12
+fi
+
+{
+  echo "created=$(date -Is)"
+  echo "base_source=$BASE_SRC"
+  echo "base_head=$BASE_HEAD"
+  echo "source_alias=$SOURCE_ALIAS"
+  echo "upstream_pr=ggml-org/llama.cpp#28213"
+  echo "patch_head=$PATCH_HEAD"
+  echo "patch_sha256=$PATCH_SHA"
+  echo "candidate_head=$(git rev-parse HEAD)"
+} > r2-meta/stage7-modern-qsa-base.txt
 
 if [[ -z "${ROCM_PATH:-}" ]]; then
-  if [[ -x /opt/host-rocm/core-10.0/lib/llvm/bin/clang++ ]]; then ROCM_PATH=/opt/host-rocm/core-10.0; else ROCM_PATH=/opt/rocm; fi
+  if [[ -x /opt/host-rocm/core-10.0/lib/llvm/bin/clang++ ]]; then
+    ROCM_PATH=/opt/host-rocm/core-10.0
+  else
+    ROCM_PATH=/opt/rocm
+  fi
 fi
 export ROCM_PATH
 HIP_CXX="${CMAKE_HIP_COMPILER:-$ROCM_PATH/lib/llvm/bin/clang++}"
 AMDGPU_TARGETS="${AMDGPU_TARGETS:-gfx1100;gfx1201}"
-BUILD="${BUILD:-$R2_SRC/build-r2-qsa-gather}"
-
-echo "ROCm path         : $ROCM_PATH"
-echo "HIP compiler      : $HIP_CXX"
-echo "AMDGPU targets    : $AMDGPU_TARGETS"
+BUILD="${BUILD:-$R2_SRC/build-r2-modern-qsa-gather}"
 
 cmake -S "$R2_SRC" -B "$BUILD" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -108,7 +140,7 @@ cmake -S "$R2_SRC" -B "$BUILD" \
   -DCMAKE_HIP_COMPILER="$HIP_CXX"
 cmake --build "$BUILD" -j"${JOBS:-$(nproc)}" --target llama-server test-backend-ops
 
-test -x "$BUILD/bin/llama-server" || { echo "ERROR: llama-server missing"; exit 20; }
+test -x "$BUILD/bin/llama-server" || { echo "ERROR: llama-server missing" >&2; exit 20; }
 if [[ -x "$BUILD/bin/test-backend-ops" ]]; then
   "$BUILD/bin/test-backend-ops" test -o TOP_K -b ROCm0 \
     || "$BUILD/bin/test-backend-ops" test -o TOP_K -b HIP0 \
@@ -117,20 +149,24 @@ fi
 
 mkdir -p "$RUNTIME"
 cp -a "$BUILD/bin/." "$RUNTIME/"
-sha256sum "$RUNTIME/llama-server" | tee "$R2_SRC/r2-meta/stage7-qsa-llama-server.sha256"
-"$RUNTIME/llama-server" --version | tee "$R2_SRC/r2-meta/stage7-qsa-version.txt" || true
+sha256sum "$RUNTIME/llama-server" | tee r2-meta/stage7-modern-qsa-llama-server.sha256
+"$RUNTIME/llama-server" --version | tee r2-meta/stage7-modern-qsa-version.txt || true
 
-# Same binary, exact inherited production arguments/env. Only QSA gather differs.
+# Same candidate binary on both aliases. Only QWEN4EXP_QSA_GATHER changes.
 python3 "$SCRIPT_DIR/install_llamaswap_r2_alias.py" \
+  --config "$CONFIG" --source-alias "$SOURCE_ALIAS" \
   --alias "$OFF_ALIAS" --r2-bin "$RUNTIME" --jmax keep \
   --env QWEN4EXP_QSA_GATHER=0 --replace
 python3 "$SCRIPT_DIR/install_llamaswap_r2_alias.py" \
+  --config "$CONFIG" --source-alias "$SOURCE_ALIAS" \
   --alias "$ON_ALIAS" --r2-bin "$RUNTIME" --jmax keep \
   --env QWEN4EXP_QSA_GATHER=1 --replace --validate
 
 echo
-echo "Stage-7 QSA gather runtime ready."
-echo "OFF alias: $OFF_ALIAS"
-echo " ON alias: $ON_ALIAS"
-echo "Runtime  : $RUNTIME/llama-server"
-echo "Next     : bash $SCRIPT_DIR/run_stage7_qsa_gather_ab.sh"
+echo "Modern QSA gather candidate ready."
+echo "Base source: $BASE_SRC"
+echo "Source alias: $SOURCE_ALIAS"
+echo "OFF alias   : $OFF_ALIAS"
+echo "ON alias    : $ON_ALIAS"
+echo "Runtime     : $RUNTIME/llama-server"
+echo "Next        : bash $SCRIPT_DIR/run_stage7_qsa_gather_ab.sh"
