@@ -14,8 +14,14 @@ Default aliases:
 Default R2 runtime:
   /app/share/llm/Qwen3.8-Flash-Next-GGUF/runtime-text/r2-stage1/bin
 
-It creates a timestamped backup next to /app/share/backup and refuses to overwrite
+It creates a timestamped backup under /app/share/backup and refuses to overwrite
 an existing R2 alias unless --replace is supplied.
+
+Additional experiment switches may be supplied repeatedly with:
+  --env KEY=VALUE
+
+Example:
+  --env GGML_JOHNV8_HC_FUSE=1 --env GGML_JOHNV8_MIX_FUSE=1
 """
 from __future__ import annotations
 
@@ -47,7 +53,6 @@ def find_block(lines: list[str], alias: str) -> tuple[int, int, int]:
             s = lines[j]
             if s.strip() and not s.lstrip().startswith("#"):
                 leading = len(s) - len(s.lstrip(" "))
-                # Same or smaller indentation marks the next YAML key outside block.
                 if leading <= indent:
                     break
             j += 1
@@ -56,14 +61,12 @@ def find_block(lines: list[str], alias: str) -> tuple[int, int, int]:
 
 
 def replace_runtime(block: str, r2_bin: str) -> tuple[str, str | None]:
-    # Find the actual llama-server executable in the cloned production block.
     m = re.search(r"(?m)^\s*(/\S*/llama-server)\s*$", block)
     old_server = m.group(1) if m else None
     if old_server:
         old_bin = str(Path(old_server).parent)
         block = block.replace(old_bin, r2_bin)
     else:
-        # Fall back to replacement of any explicit runtime-text/.../bin path.
         block, n = re.subn(
             r"/app/share/llm/Qwen3\.8-Flash-Next-GGUF/runtime-text/[^\s\"']+/bin",
             r2_bin,
@@ -75,7 +78,6 @@ def replace_runtime(block: str, r2_bin: str) -> tuple[str, str | None]:
 
 
 def inject_env(block: str, indent: int, key: str, value: str) -> str:
-    # Replace existing entry if present.
     env_pat = re.compile(rf'(?m)^(\s*)-\s*["\']?{re.escape(key)}=[^\n"\']*["\']?\s*$')
     if env_pat.search(block):
         return env_pat.sub(lambda m: f'{m.group(1)}- "{key}={value}"', block, count=1)
@@ -94,6 +96,19 @@ def inject_env(block: str, indent: int, key: str, value: str) -> str:
     return "".join(lines)
 
 
+def parse_env(items: list[str]) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"invalid --env {item!r}; expected KEY=VALUE")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise ValueError(f"invalid environment key: {key!r}")
+        out.append((key, value))
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=CONFIG)
@@ -101,9 +116,16 @@ def main() -> int:
     ap.add_argument("--alias", default=DST_ALIAS)
     ap.add_argument("--r2-bin", default=R2_BIN)
     ap.add_argument("--jmax", default="32")
+    ap.add_argument("--env", action="append", default=[], help="extra KEY=VALUE override; repeatable")
     ap.add_argument("--replace", action="store_true")
     ap.add_argument("--validate", action="store_true", help="run llama-swap -validate after writing")
     args = ap.parse_args()
+
+    try:
+        extra_env = parse_env(args.env)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
 
     p = Path(args.config)
     text = p.read_text(encoding="utf-8")
@@ -121,7 +143,6 @@ def main() -> int:
             print(f"ERROR: destination alias already exists: {args.alias}; use --replace", file=sys.stderr)
             return 3
         del lines[d0:d1]
-        # Source indices may shift if destination was before source.
         text = "".join(lines)
         lines = text.splitlines(True)
         s0, s1, indent = find_block(lines, args.source_alias)
@@ -138,9 +159,10 @@ def main() -> int:
     )
     block, old_server = replace_runtime(block, args.r2_bin)
     block = inject_env(block, indent, "GGML_JOHNV8_MMQ_ID_JMAX", args.jmax)
+    for key, value in extra_env:
+        block = inject_env(block, indent, key, value)
 
-    # Add a comment that makes the experimental nature obvious in the live config.
-    comment = " " * indent + "# Flash Next R2 experimental alias: production block cloned verbatim; only runtime/JMAX differ\n"
+    comment = " " * indent + "# Flash Next R2 experimental alias: cloned from production; only runtime/explicit env overrides differ\n"
     block = comment + block
 
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -148,7 +170,6 @@ def main() -> int:
     backup_dir.mkdir(parents=True, exist_ok=False)
     shutil.copy2(p, backup_dir / p.name)
 
-    # Insert immediately after source block, keeping source production alias untouched.
     lines[s1:s1] = ["\n", block]
     tmp = p.with_suffix(p.suffix + ".r2tmp")
     tmp.write_text("".join(lines), encoding="utf-8")
@@ -159,6 +180,8 @@ def main() -> int:
     print(f"OK r2_alias={args.alias}")
     print(f"OK r2_bin={args.r2_bin}")
     print(f"OK JMAX={args.jmax}")
+    for key, value in extra_env:
+        print(f"OK env {key}={value}")
     if old_server:
         print(f"INFO production_server_preserved_in_source={old_server}")
 
