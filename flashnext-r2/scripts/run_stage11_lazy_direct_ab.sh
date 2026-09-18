@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BASELINE="${BASELINE:-qwen3.8-flash-next-r2-modern-lazy-mmap:256k}"
 R2="${R2:-qwen3.8-flash-next-r2-modern-lazy-direct:256k}"
 OUT="${OUT:-/app/share/openclaw_tools/logs/flashnext-r2-modern-lazy-direct-realworld.json}"
+FORCE_ARG=()
+[[ "${FORCE:-0}" == "1" ]] && FORCE_ARG=(--force)
 
 # Do NOT use the generic repeated-seed PP benchmark here. PLE mmap behaviour is
 # specifically sensitive to token/ngram diversity: repetitive prompts can keep
@@ -22,7 +24,7 @@ python3 "$SCRIPT_DIR/bench_stage11_ple_realworld.py" \
   --pp "${PP:-512,2048,8192}" \
   --min-ngram4-ratio "${MIN_NGRAM4_RATIO:-0.70}" \
   --out "$OUT" \
-  ${FORCE:+--force}
+  "${FORCE_ARG[@]}"
 
 python3 "$SCRIPT_DIR/analyze_stage11_lazy_direct.py" \
   "$OUT" \
