@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Long-context llama-swap A/B for Qwen3.8 Flash Next QSA gather.
+"""Long-context llama-swap A/B for Qwen3.8 Flash Next QSA/TOP_K work.
 
 Runs the real :8090 path and measures decode at increasing context depth. The
 prompt contains a unique needle around 15% depth; every run must retrieve the
 same marker so a throughput win cannot hide a broken sparse-attention path.
 
+TG measurement is intentionally fixed-length: ignore_eos=true forces the server
+to generate n_predict tokens. Without this, the old "only output the marker"
+prompt often ended after a handful of tokens and produced a very noisy TG number.
+
 Default sequence is OFF -> ON. Use --rounds 4 for OFF/ON/OFF/ON confirmation
-once the exploratory pass looks good, because 131k prefills are not free and
+once an exploratory pass looks good, because 131k prefills are not free and
 apparently electrons also have employment rights.
 """
 from __future__ import annotations
@@ -58,8 +62,11 @@ def busy(x) -> bool:
     state = x.get("state")
     if isinstance(state, str) and state.lower() not in ("", "idle", "none"):
         return True
-    return any(busy(v) for k, v in x.items()
-               if k not in ("params", "prompt", "generated", "timings") and isinstance(v, (dict, list)))
+    return any(
+        busy(v)
+        for k, v in x.items()
+        if k not in ("params", "prompt", "generated", "timings") and isinstance(v, (dict, list))
+    )
 
 
 def unload(url: str, model: str, force: bool):
@@ -94,14 +101,18 @@ def detokenize(url: str, model: str, ids: list[int]) -> str:
 def make_prompt(url: str, model: str, target: int) -> str:
     header = (
         "这是一个长上下文检索测试。材料中只有一个 NEEDLE 标记。"
-        "请找到它，并且最终只输出 NEEDLE 方括号中的字符串，不要解释。\n材料开始：\n"
+        "请找到它。回答时第一行必须原样输出 NEEDLE 方括号中的字符串；"
+        "第一行之后可以继续生成测试文本。\n材料开始：\n"
     )
     filler = (
         "记录显示仓库每天核对温度、湿度、箱号、流水号和装卸时间，"
         "本段只是无关背景材料，不包含答案。\n"
     )
     needle = f"\nNEEDLE[{MARKER}]\n"
-    footer = "\n材料结束。请只输出唯一 NEEDLE 方括号中的字符串。"
+    footer = (
+        "\n材料结束。第一行必须原样输出唯一 NEEDLE 方括号中的字符串。"
+        "随后继续正常生成，测试程序会强制固定输出 token 数。"
+    )
 
     h = tokenize(url, model, header)
     f = tokenize(url, model, filler)
@@ -110,7 +121,6 @@ def make_prompt(url: str, model: str, target: int) -> str:
     if not f:
         raise RuntimeError("filler tokenization empty")
 
-    # Keep room for instruction + marker + footer. Place the marker around 15%.
     usable = max(0, target - len(h) - len(n) - len(t))
     before_n = max(0, int(target * 0.15) - len(h))
     before = (f * ((before_n + len(f) - 1) // len(f)))[:before_n]
@@ -143,6 +153,7 @@ def run_one(url: str, model: str, target: int, n_predict: int):
         "seed": 1234,
         "cache_prompt": False,
         "stream": False,
+        "ignore_eos": True,
     }
     t0 = time.time()
     r = http_json("POST", url + "/completion", payload, timeout=14400)
@@ -152,16 +163,20 @@ def run_one(url: str, model: str, target: int, n_predict: int):
     tm = r.get("timings", {}) or {}
     drafted, accepted = extract_counts(r)
     content = r.get("content", "")
+    predicted_n = tm.get("predicted_n")
+    full_generation = isinstance(predicted_n, (int, float)) and predicted_n >= n_predict
     return {
         "target_depth": target,
+        "requested_predict": n_predict,
         "prompt_n": tm.get("prompt_n"),
         "pp": tm.get("prompt_per_second"),
-        "predicted_n": tm.get("predicted_n"),
+        "predicted_n": predicted_n,
         "tg": tm.get("predicted_per_second"),
         "wall_s": wall,
         "drafted": drafted,
         "accepted": accepted,
         "marker_hit": MARKER in content,
+        "full_generation": full_generation,
         "content": content,
     }
 
@@ -185,6 +200,8 @@ def main():
         "url": args.url,
         "marker": MARKER,
         "depths": depths,
+        "requested_predict": args.tg,
+        "ignore_eos": True,
         "sequence": seq,
         "legs": [],
     }
@@ -202,14 +219,27 @@ def main():
             acc = None
             if isinstance(row["drafted"], (int, float)) and row["drafted"]:
                 acc = row["accepted"] / row["drafted"] if isinstance(row["accepted"], (int, float)) else None
-            print(json.dumps({
-                "target": d,
-                "prompt_n": row["prompt_n"],
-                "pp": row["pp"],
-                "tg": row["tg"],
-                "marker_hit": row["marker_hit"],
-                "acceptance": acc,
-            }, ensure_ascii=False), flush=True)
+            print(
+                json.dumps(
+                    {
+                        "target": d,
+                        "prompt_n": row["prompt_n"],
+                        "predicted_n": row["predicted_n"],
+                        "pp": row["pp"],
+                        "tg": row["tg"],
+                        "marker_hit": row["marker_hit"],
+                        "full_generation": row["full_generation"],
+                        "acceptance": acc,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            if not row["full_generation"]:
+                raise RuntimeError(
+                    f"server returned only {row['predicted_n']} generated tokens at depth {d}; "
+                    f"fixed-length TG requires {args.tg}. Check ignore_eos support before trusting this run."
+                )
         leg["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         leg["running_after"] = get_optional(args.url, "/running")
         result["legs"].append(leg)
