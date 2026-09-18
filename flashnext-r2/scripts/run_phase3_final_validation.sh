@@ -33,6 +33,14 @@ curl -fsS --max-time 20 http://127.0.0.1:8090/v1/models > "$RUN_DIR/models-prefl
   echo "ERROR llama-swap :8090 unhealthy" >&2; exit 6;
 }
 
+# Native qwen4exp recurrent rollback is a prerequisite, not an optional tuning
+# item. Re-audit after QSA/pooled/PLE/FR-Spec composition so a semantic merge
+# cannot silently reintroduce the old whole-state checkpoint hot path.
+echo "=== Gate 0: native qwen4exp recurrent rollback ==="
+SRC="$FINAL_SRC" CONFIG="$CONFIG" ALIAS="$FINAL_ALIAS" \
+  bash "$SCRIPT_DIR/verify_qwen4exp_native_rs_rollback.sh"
+note "NATIVE_RS_ROLLBACK=PASS"
+
 # 1) Short/normal workload, exact greedy output, PP/TG non-regression.
 SHORT_JSON="$RUN_DIR/short-ab.json"
 echo "=== Gate 1: short/normal PP+TG exact A/B ==="
@@ -95,9 +103,9 @@ python3 "$SCRIPT_DIR/bench_stage10_cached_largepp.py" \
 note "CACHED_GATE=PASS"
 note "CACHED_RESULT=$CACHED_JSON"
 
-# 4) 64K rollback/checkpoint-style stress. The helper was originally written for
-# pooled OFF/ON, but its invariants are general: retrieval marker, deterministic
-# generated prefix and active MTP drafting must all survive the long-context path.
+# 4) 64K rollback/checkpoint-style stress. With native qwen4exp recurrent
+# rollback this should exercise sequence removal/replay without serializing the
+# full recurrent state on every speculative round.
 ROLLBACK_JSON="$RUN_DIR/rollback-stress.json"
 echo
 echo "=== Gate 4: long-context rollback/determinism stress ==="
@@ -112,7 +120,6 @@ python3 "$SCRIPT_DIR/bench_stage8_rollback_stress.py" \
 note "ROLLBACK_GATE=PASS"
 note "ROLLBACK_RESULT=$ROLLBACK_JSON"
 
-# Final integrity: no alias replacement occurred.
 require_alias "$PROD_ALIAS" || { echo "ERROR production alias disappeared" >&2; exit 20; }
 note "PRODUCTION_ALIAS=$PROD_ALIAS"
 note "FINAL_ALIAS=$FINAL_ALIAS"
@@ -126,4 +133,4 @@ echo "PHASE-3 FINAL PRE-SWEEP VALIDATION PASSED"
 echo "================================================================"
 cat "$SUMMARY"
 echo
-echo "The candidate is now eligible for MTP/JMAX/HIP-Graph/gfx1201 parameter sweeps. Production is still untouched."
+echo "The candidate is now eligible for MTP-depth/HIP-Graph/gfx1201 microfusion sweeps. Production is still untouched."
