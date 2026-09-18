@@ -20,6 +20,9 @@ an existing R2 alias unless --replace is supplied.
 Additional experiment switches may be supplied repeatedly with:
   --env KEY=VALUE
 
+Inherited experiment switches may be explicitly removed from the cloned block with:
+  --unset-env KEY
+
 MTP sweep aliases can override only the existing production argument with:
   --spec-draft-n-max N
 
@@ -110,16 +113,25 @@ def inject_env(block: str, indent: int, key: str, value: str) -> str:
     return "".join(lines)
 
 
+def remove_env(block: str, key: str) -> tuple[str, int]:
+    pat = re.compile(rf'(?m)^\s*-\s*["\']?{re.escape(key)}=[^\n"\']*["\']?\s*\n?')
+    return pat.subn("", block)
+
+
+def validate_key(key: str) -> str:
+    key = key.strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        raise ValueError(f"invalid environment key: {key!r}")
+    return key
+
+
 def parse_env(items: list[str]) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     for item in items:
         if "=" not in item:
             raise ValueError(f"invalid --env {item!r}; expected KEY=VALUE")
         key, value = item.split("=", 1)
-        key = key.strip()
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-            raise ValueError(f"invalid environment key: {key!r}")
-        out.append((key, value))
+        out.append((validate_key(key), value))
     return out
 
 
@@ -131,6 +143,7 @@ def main() -> int:
     ap.add_argument("--r2-bin", default=R2_BIN)
     ap.add_argument("--jmax", default="32")
     ap.add_argument("--env", action="append", default=[], help="extra KEY=VALUE override; repeatable")
+    ap.add_argument("--unset-env", action="append", default=[], help="remove inherited KEY from cloned env block; repeatable")
     ap.add_argument("--spec-draft-n-max", type=int, default=None, help="replace existing --spec-draft-n-max value")
     ap.add_argument("--replace", action="store_true")
     ap.add_argument("--validate", action="store_true", help="run llama-swap -validate after writing")
@@ -142,6 +155,7 @@ def main() -> int:
 
     try:
         extra_env = parse_env(args.env)
+        unset_env = [validate_key(x) for x in args.unset_env]
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
@@ -185,6 +199,14 @@ def main() -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 5
 
+    # Apply removals first, then explicit overrides. This makes --env win when the
+    # same key is supplied in both lists and lets an ON alias guarantee that a
+    # presence-based kill switch is truly absent.
+    removed = {}
+    for key in unset_env:
+        block, n = remove_env(block, key)
+        removed[key] = n
+
     block = inject_env(block, indent, "GGML_JOHNV8_MMQ_ID_JMAX", args.jmax)
     for key, value in extra_env:
         block = inject_env(block, indent, key, value)
@@ -209,6 +231,8 @@ def main() -> int:
     print(f"OK JMAX={args.jmax}")
     if args.spec_draft_n_max is not None:
         print(f"OK --spec-draft-n-max={args.spec_draft_n_max}")
+    for key in unset_env:
+        print(f"OK unset env {key} removed_entries={removed[key]}")
     for key, value in extra_env:
         print(f"OK env {key}={value}")
     if old_server:
