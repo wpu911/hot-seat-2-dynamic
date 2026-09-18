@@ -34,7 +34,7 @@ PR #28243 当前依赖的 Sep18 upstream base：
 911f6cdc8ab8a530b2bee09ee61471a6f3178eeb
 ```
 
-两者之间已经隔了大量 upstream 变化。因此不再采用：
+不再采用：
 
 ```text
 Sep11 production
@@ -94,6 +94,33 @@ Sep18 upstream + exact same production custom overlay
 
 只有 Modern Foundation 本身通过后，后续 Stage 才有意义。
 
+### 1.1 先做 carry-over audit，禁止重复搬旧优化
+
+```bash
+bash flashnext-r2/scripts/verify_modern_foundation_carryover.sh
+```
+
+已经核对 Sep18 foundation 中存在：
+
+```text
+seq_pos_tok_le()
+  → PLE predecessor 通过 per-sequence position index 直接查
+  → 不再需要旧 #27977 的全 cache × 256 seq 扫描
+
+qwen4exp block pooling
+  → 已用小 r 的 slice + add
+
+qwen4exp indexer head reduction
+  → 已用 strided slice + add
+  → 不再需要旧 #27977 的 transpose + sum_rows 改法
+
+indexer KV cache
+  → 已把 indexer cache 伪装成 MLA 形状从而不分配无用 V cache
+  → #28330 的核心优化已经存在
+```
+
+因此旧 #27977 / #28330 **不得整包再次移植**。其中 QSA gather 仍是独立变量，继续走 Stage 7。
+
 ---
 
 ## 2. Stage 10：新版 Qwen3.8 Flash Next MTP #28243
@@ -108,7 +135,7 @@ commits: 12
 files: 19
 ```
 
-Stage 10 不是再从 Sep11 源码硬套 patch，而是在 **Modern Foundation** 上仅叠加 `base..head` 的 PR28243 delta。
+Stage 10 在 **Modern Foundation** 上仅叠加 `base..head` 的 PR28243 delta。
 
 准备：
 
@@ -147,9 +174,9 @@ MTP catch-up / rollback
 
 ---
 
-## 3. Stage 14：ROCm TOP_K #28313
+## 3. Stage 14：ROCm TOP_K #28313，先 smoke 再决定是否烧 128K
 
-当前 AMD 长上下文 QSA 的 TOP_K 路径仍值得单独优化。PR #28313：
+PR #28313：
 
 ```text
 ROCm: resolve TOP_K kernels
@@ -158,7 +185,7 @@ changed files: 1
   ggml/src/ggml-cuda/top-k.cu
 ```
 
-该 PR 对 HIP TOP_K 增加/重排了 small-case、n-ary 和专用选择路径。上游 microbenchmark 在多种 shape 上报告明显降低 kernel 时间，但是否能转化成这台 `gfx1100 + gfx1201` 的 Flash Next TG 提升，必须本机端到端验证。
+它对 HIP TOP_K 增加/重排了 small-case、n-ary 和 radix 路径。但 Flash Next QSA 的典型 `k≈2048` multi-row shape 并不会吃到所有 small-k 微基准的巨大增幅，因此先做低成本端到端 smoke，不拿上游 microbenchmark 给自己的机器开支票。
 
 准备：
 
@@ -178,13 +205,26 @@ qwen3.8-flash-next-r2-topk-base-nograph:256k
 qwen3.8-flash-next-r2-topk-nograph:256k
 ```
 
-测试：
+默认先跑 smoke：
 
 ```bash
 bash flashnext-r2/scripts/run_stage14_rocm_topk_ab.sh
 ```
 
-长上下文 ladder 默认：
+优先只看：
+
+```text
+32K
+64K
+```
+
+若正常 graphs-ON 路径有稳定实质收益，再跑完整确认：
+
+```bash
+FULL=1 bash flashnext-r2/scripts/run_stage14_rocm_topk_ab.sh
+```
+
+完整 ladder：
 
 ```text
 16K
@@ -195,7 +235,7 @@ bash flashnext-r2/scripts/run_stage14_rocm_topk_ab.sh
 
 每个深度不仅测 TG，还必须通过 needle retrieval，避免 TOP_K 跑快了却选错 QSA cell。
 
-Stage 14 有三个结论：
+Stage 14 三种结论：
 
 ```text
 PASS
@@ -203,21 +243,169 @@ PASS
 
 HIP_GRAPH_INTERACTION
   graphs OFF 明显变快，但 graphs ON 没吃到收益
-  此时先查 HIP Graph，不直接否定 TOP_K kernel
+  先查 HIP Graph，不直接否定 TOP_K kernel
 
 FAIL
   无实质提升或出现检索 / acceptance / PP 回退
 ```
 
-之所以同时测 graph ON/OFF，是因为 #28313 上游 benchmark 明确关闭了 HIP graphs，且提到 ROCm graph update 存在问题。不能拿 graph-off 微基准直接宣布生产提速。
+#28313 上游 benchmark 明确关闭 HIP graphs，并提到 ROCm graph update 问题，因此 graph-off 微基准不能直接代表生产收益。
 
-另外，PR 讨论中曾争论 RDNA wave64，作者随后表示回退到安全 wave32 路线。当前实验只跟随 pin 的 PR head，不自行添加 wave64 魔改。
+PR 讨论中还出现过 RDNA wave64 路线争议，作者后来回退安全 wave32。本轮只测 pinned PR head，不额外强开 wave64。
 
 ---
 
-## 4. Stage 13：FR-Spec
+## 4. Stage 7：QSA Gather #28213
 
-新版 MTP 通过后，再缩 speculative draft vocabulary，不提前把 FR-Spec 和 MTP runtime 改动混在一起。
+这条目前是长上下文 TG 的高优先级候选。
+
+默认基线：
+
+```text
+Modern Foundation
++ PR28243 MTP
+```
+
+如果 Stage 14 TOP_K 已确认胜出，则把 Stage14 source + alias 一起作为 Stage7 base，不能只换其中一个。
+
+准备：
+
+```bash
+bash flashnext-r2/scripts/prepare_stage7_qsa_gather.sh
+```
+
+同一 binary，仅切换：
+
+```text
+QWEN4EXP_QSA_GATHER=0
+QWEN4EXP_QSA_GATHER=1
+```
+
+默认先跑 32K / 64K smoke：
+
+```bash
+bash flashnext-r2/scripts/run_stage7_qsa_gather_ab.sh
+```
+
+有收益后再跑：
+
+```bash
+FULL=1 bash flashnext-r2/scripts/run_stage7_qsa_gather_ab.sh
+```
+
+完整确认覆盖短上下文和 128K；每个深度必须 needle retrieval 正确，而且 TG 测试必须实际生成要求数量的 token，不能让十几个 token 的 early-EOS 冒充 TG128。
+
+---
+
+## 5. Stage 8：Incremental Pooled-Key Cache #28699
+
+只在已经通过的 QSA gather 树上增加 pooled cache：
+
+```text
+Modern Foundation
++ MTP
++ QSA gather
++ pooled-key cache   <- 唯一新变量
+```
+
+准备与测试：
+
+```bash
+bash flashnext-r2/scripts/prepare_stage8_qsa_pooled.sh
+bash flashnext-r2/scripts/run_stage8_qsa_pooled_ab.sh
+bash flashnext-r2/scripts/run_stage8_rollback_stress.sh
+```
+
+同一 binary，QSA gather 两边都开；只有：
+
+```text
+OFF: LLAMA_QSA_NO_POOLED_CACHE=1
+ON : unset LLAMA_QSA_NO_POOLED_CACHE
+```
+
+这里性能 PASS 还不够。必须额外过：
+
+```text
+MTP draft / acceptance
+seq_rm rollback
+cached prefix
+checkpoint/state restore
+长输出 deterministic prefix
+needle retrieval
+```
+
+这一步恰好踩在以前最爱出妖怪的缓存/回滚交界处，所以不允许“跑得快就算了”。
+
+---
+
+## 6. Stage 11：PLE Direct Read #29030，使用真实高多样性语料
+
+Stage 11 已经改为建立在 **Modern-MTP** 上，不再回到 Sep11 runtime：
+
+```text
+BASE_SRC:
+/app/share/llama_box/src/llama.cpp-flashnext-r2-modern-mtp-20260918
+
+candidate:
+/app/share/llama_box/src/llama.cpp-flashnext-r2-modern-lazy-direct-20260918
+```
+
+准备：
+
+```bash
+bash flashnext-r2/scripts/prepare_stage11_lazy_direct.sh
+```
+
+两个 alias 使用字节相同的真实 `llama-server` ELF，只由 wrapper 强制：
+
+```text
+qwen3.8-flash-next-r2-modern-lazy-mmap:256k
+  --lazy-mode on
+
+qwen3.8-flash-next-r2-modern-lazy-direct:256k
+  --lazy-mode on-direct
+```
+
+若 source alias 显式含 `--no-mmap`，prepare 直接停止，不制造假 A/B。
+
+测试：
+
+```bash
+bash flashnext-r2/scripts/run_stage11_lazy_direct_ab.sh
+```
+
+**不能再使用重复同一句话的 PP prompt。** #29030 优化的正是巨大 PLE 表的随机行读取，重复文本会反复命中少量 n-gram/PLE rows，可能把 mmap 的 page-fault 成本隐藏掉。
+
+Stage11 专用 benchmark 现在会：
+
+```text
+读取最近本地 OpenClaw session 文本
+→ 只在 localhost 上 tokenizer
+→ 切出互不重叠的 512 / 2048 / 8192 token 窗口
+→ 检查 unique 4-gram ratio，默认最低 0.70
+→ 低多样性直接拒测
+→ mmap/direct 交替 A/B
+→ 结果只写指标与 hash，不写 session 文本/文件名
+```
+
+本地文本不足时只按有界 chunk 补合成语料，不再把 token deficit 错当“行数”一次生成数万行。
+
+Gate：
+
+```text
+median PP gain >= 5%
+任一 PP 回退不得超过 3%
+TG 回退不得超过 2%
+TG sanity 至少实际生成 32 token
+同 binary 两种 lazy mode 输出一致
+语料多样性达标
+```
+
+---
+
+## 7. Stage 13：FR-Spec
+
+新版 MTP 通过后，再缩 speculative draft vocabulary，不提前把 FR-Spec 与其他 kernel / I/O 变量揉成一锅。
 
 准备：
 
@@ -253,60 +441,7 @@ cached Large-PP
 
 ---
 
-## 5. PLE Direct Read
-
-Flash Next 的 PLE 大表读取仍作为 PP 专项优化保留。
-
-```bash
-bash flashnext-r2/scripts/prepare_stage11_lazy_direct.sh
-bash flashnext-r2/scripts/run_stage11_lazy_direct_ab.sh
-```
-
-主要看：
-
-```text
-PP
-page fault / I/O 行为
-TG 不回退
-```
-
-如果当前生产模型路径显式依赖 `--no-mmap`，不得制造一个不成立的 on vs on-direct A/B。
-
----
-
-## 6. QSA Gather + Incremental Pooled-Key Cache
-
-### QSA gather
-
-```bash
-bash flashnext-r2/scripts/prepare_stage7_qsa_gather.sh
-bash flashnext-r2/scripts/run_stage7_qsa_gather_ab.sh
-```
-
-### pooled-key incremental cache
-
-```bash
-bash flashnext-r2/scripts/prepare_stage8_qsa_pooled.sh
-bash flashnext-r2/scripts/run_stage8_qsa_pooled_ab.sh
-python3 flashnext-r2/scripts/bench_stage8_rollback_stress.py
-```
-
-最终组合时，Stage 14 TOP_K winner 应作为 QSA 基础层，再叠加 gather / pooled cache 重跑完整 ladder。
-
-不能只看 4K/16K。真正关注：
-
-```text
-32K
-64K
-128K
-cached branch
-rollback
-checkpoint/state restore
-```
-
----
-
-## 7. 最后才扫参数
+## 8. 最后才扫参数和 RDNA4 专项
 
 代码路径确定后再扫：
 
@@ -319,48 +454,57 @@ GDN fusion
 JohnTDI 特有 RDNA4 kernel（只在 gfx1201 路径上）
 ```
 
-`gfx1201` 专用优化不能默认套给 `gfx1100`。双卡异构环境必须分别验证。
+`gfx1201` 专用优化不能默认套给 `gfx1100`。当前双卡是异构 GPU，必须分别验证，不能因为两块卡都姓 AMD 就假装它们共享童年。
 
 ---
 
-## 8. 明确不走的路线
+## 9. 明确不走 / 不重复的路线
 
 ```text
 CUDA sparse FA #28770
-  当前实现仍是 NVIDIA CUDA 路线，HIP 不直接套。
+  NVIDIA CUDA 路线，不直接套 HIP。
+
+旧 #27977 整包
+  predecessor/indexer-head 等核心优化已经进入 Sep18 foundation 的后续实现；
+  只保留仍独立的 QSA gather Stage7。
+
+#28330 indexer V-cache fix
+  Sep18 foundation 已有等价实现，不重复移植。
 
 旧 n-gram #27992
-  若 seq_pos_tok_le() 已在 modern foundation，则不重复移植。
+  foundation 已有 seq_pos_tok_le() per-sequence position index，不重复移植。
 
 多 stream fork/join
   以前 ROCm 实测同步代价过高，不进当前主线。
 
 wave64 强开
-  #28313 讨论已暴露维护/兼容风险，本轮只测安全的 pinned PR head。
+  #28313 讨论已暴露 HIP 维护/兼容风险，本轮只测安全 pinned head。
 ```
 
 ---
 
-## 9. 最终组合顺序
+## 10. 最终组合顺序
 
-不是把所有 PASS 的 patch 一股脑堆上去。最终 clean runtime 应按：
+不是把所有 PASS patch 一股脑堆起来。最终 clean runtime：
 
 ```text
 Modern Foundation
     ↓
 MTP winner
     ↓
-ROCm TOP_K winner
-    ↓
-FR-Spec winner（如果成立）
-    ↓
-PLE winner
+ROCm TOP_K winner（只有 Stage14 真 PASS 才保留）
     ↓
 QSA gather
     ↓
 pooled-key cache
     ↓
+PLE direct-read winner
+    ↓
+FR-Spec winner（如果成立）
+    ↓
 MTP/JMAX/Graph 参数 sweep
+    ↓
+gfx1201 专项 kernel A/B
     ↓
 short + 32K + 64K + 128K
 + cached Large-PP
