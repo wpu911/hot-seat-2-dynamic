@@ -2,9 +2,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BASELINE="${BASELINE:-qwen3.8-flash-next:256k}"
-R2="${R2:-qwen3.8-flash-next-r2-mtp-upstream:256k}"
-OUT="${OUT:-/app/share/openclaw_tools/logs/flashnext-r2-mtp-upstream-ab.json}"
+
+# Stage 10 must isolate MTP. The baseline is therefore the Stage-12 HC-only
+# runtime, not production. Candidate = the same HC stack + PR #28243.
+BASELINE="${BASELINE:-qwen3.8-flash-next-r2-upstream-hc:256k}"
+R2="${R2:-qwen3.8-flash-next-r2-hc-mtp:256k}"
+OUT="${OUT:-/app/share/openclaw_tools/logs/flashnext-r2-stage10-hc-vs-hc-mtp.json}"
 
 python3 "$SCRIPT_DIR/bench_llamaswap_ab.py" \
   --baseline "$BASELINE" \
@@ -26,4 +29,5 @@ python3 "$SCRIPT_DIR/analyze_stage10_mtp.py" \
 
 echo
 echo "Stage-10 MTP A/B complete."
-echo "A PASS is only a candidate result; long-context Stage-8/QSA tests must still pass on the final combined runtime."
+echo "Baseline and candidate share the same upstream HC lineage; the intended variable is PR #28243 MTP."
+echo "A PASS is still only a candidate result; cached Large-PP and long-context rollback/QSA regression must pass before production merge."
