@@ -20,11 +20,13 @@ R2_ALIAS="${R2_ALIAS:-qwen3.8-flash-next-r2-mtp-upstream:256k}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_DIR="${PATCH_DIR:-/app/share/llama_box/src/flashnext-r2-vendor}"
 
-# First PR commit parent -> pinned current PR head. This is an immutable commit
-# range, unlike downloading /pull/28243.patch after the PR changes tomorrow.
-MTP_BASE="95ef7fc16054e63b427a3ef00188e055ef7586d8"
+# Pin the PR delta to the exact base/head reported by GitHub on 2026-09-18.
+# Do NOT diff from the first historical parent: the branch has merged newer
+# upstream master, and that older range would drag unrelated post-Sep11 master
+# changes into the experiment.
+MTP_BASE="911f6cdc8ab8a530b2bee09ee61471a6f3178eeb"
 MTP_HEAD="53b1389d0bf98fa367e2a0ce0475008e762ebf28"
-PATCH="$PATCH_DIR/pr28243-qwen4exp-mtp-${MTP_HEAD:0:8}.patch"
+PATCH="$PATCH_DIR/pr28243-qwen4exp-mtp-${MTP_BASE:0:8}-${MTP_HEAD:0:8}.patch"
 PATCH_URL="https://github.com/danielhanchen/llama.cpp/compare/${MTP_BASE}...${MTP_HEAD}.patch"
 
 if [[ ! -e "$PROD_SRC/.git" ]]; then
@@ -62,7 +64,9 @@ if [[ ! -f "$PATCH" ]]; then
   curl -fL --retry 3 --connect-timeout 20 "$PATCH_URL" -o "$PATCH"
 fi
 
-# A compare patch is format-patch mail. It must include the pinned head commit.
+# A compare patch is a mail patch series. Pin both ends: if upstream rebases or
+# the compare unexpectedly resolves a different range, fail rather than benchmark
+# mystery code wearing a familiar filename.
 if ! grep -qi "${MTP_HEAD:0:12}" "$PATCH"; then
   echo "ERROR: downloaded MTP patch does not contain pinned head $MTP_HEAD" >&2
   exit 7
@@ -71,27 +75,28 @@ PATCH_SHA="$(sha256sum "$PATCH" | awk '{print $1}')"
 
 echo "Production exact base: $PROD_SRC"
 echo "Production HEAD      : $(git -C "$PROD_SRC" rev-parse HEAD)"
-echo "MTP PR range         : $MTP_BASE..$MTP_HEAD"
+echo "MTP PR delta         : $MTP_BASE..$MTP_HEAD"
 echo "Patch SHA256         : $PATCH_SHA"
 echo "Candidate worktree   : $R2_SRC"
 echo "Candidate runtime    : $RUNTIME"
 
 git -C "$PROD_SRC" worktree add --detach "$R2_SRC" HEAD
 mkdir -p "$R2_SRC/r2-meta"
+R2_BASE_HEAD="$(git -C "$R2_SRC" rev-parse HEAD)"
 {
   echo "created=$(date -Is)"
   echo "exact_production_source=$PROD_SRC"
-  echo "exact_production_head=$(git -C "$PROD_SRC" rev-parse HEAD)"
+  echo "exact_production_head=$R2_BASE_HEAD"
   echo "upstream_pr=ggml-org/llama.cpp#28243"
-  echo "mtp_base=$MTP_BASE"
-  echo "mtp_head=$MTP_HEAD"
+  echo "pr_base=$MTP_BASE"
+  echo "pr_head=$MTP_HEAD"
   echo "patch_sha256=$PATCH_SHA"
 } > "$R2_SRC/r2-meta/stage10-mtp-base.txt"
 
 cd "$R2_SRC"
 
 # Preserve the PR's commit series. If custom HotSeat MTP code overlaps, stop at
-# the first real semantic conflict instead of accepting a suspicious fuzzy apply.
+# the first semantic conflict instead of accepting a suspicious fuzzy apply.
 if ! git -c user.name='FlashNext R2 Experiment' \
          -c user.email='flashnext-r2@local.invalid' \
          am --3way "$PATCH"; then
@@ -104,13 +109,15 @@ if ! git -c user.name='FlashNext R2 Experiment' \
   exit 10
 fi
 
-git diff --check HEAD~12..HEAD || true
-git diff HEAD~12..HEAD > r2-meta/stage10-mtp-stack.diff || true
+git diff --check "$R2_BASE_HEAD"..HEAD
+git diff "$R2_BASE_HEAD"..HEAD > r2-meta/stage10-mtp-stack.diff
+printf '%s\n' "$R2_BASE_HEAD" > r2-meta/stage10-exact-production-head.txt
+printf '%s\n' "$(git rev-parse HEAD)" > r2-meta/stage10-candidate-head.txt
 
 # Feature probes. These are more useful than trusting a successful patch exit.
 grep -Rni 'qwen4exp_shared_model' src/models/qwen4exp.cpp | tee r2-meta/mtp-shared-model-probe.txt
 grep -RniE 'n_layer_nextn|LLM_GRAPH_TYPE_DECODER_MTP|QWEN4EXP MTP' src common \
-  | head -n 160 | tee r2-meta/mtp-runtime-probes.txt
+  | head -n 200 | tee r2-meta/mtp-runtime-probes.txt
 
 if ! grep -q 'qwen4exp_shared_model' src/models/qwen4exp.cpp; then
   echo "ERROR: shared target-module path missing after PR port" >&2
@@ -119,6 +126,16 @@ fi
 if ! grep -q 'LLM_GRAPH_TYPE_DECODER_MTP' src/models/qwen4exp.cpp; then
   echo "ERROR: qwen4exp MTP graph missing after PR port" >&2
   exit 12
+fi
+
+# Critical correctness fix in the current PR series: qwen4exp may borrow target
+# embeddings through ctx_other, but it does NOT share the target KV/recurrent
+# memory. If this guard is missing, draft catch-up/rollback can be skipped and
+# M-RoPE positions repeat. That is not a speed optimization; it is a correctness
+# landmine wearing a stopwatch.
+if ! grep -q 'gemma4-assistant' common/speculative.cpp; then
+  echo "ERROR: PR28243 qwen4exp memory-sharing correctness guard is missing" >&2
+  exit 13
 fi
 
 if [[ -z "${ROCM_PATH:-}" ]]; then
