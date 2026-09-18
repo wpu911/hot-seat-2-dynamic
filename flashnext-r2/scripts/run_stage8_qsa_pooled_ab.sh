@@ -55,7 +55,7 @@ if [[ "$RC" -eq 0 && "$MODE" == smoke ]]; then
   echo "After full PASS, rollback/checkpoint stress is mandatory."
 elif [[ "$RC" -eq 0 ]]; then
   echo "POOLED_FULL=PASS"
-  echo "Now run: BASELINE=$BASELINE R2=$R2 python3 $SCRIPT_DIR/bench_stage8_rollback_stress.py"
+  echo "Now run: bash $SCRIPT_DIR/run_stage8_rollback_stress.sh"
 else
   echo "POOLED_${MODE^^}=FAIL"
 fi
