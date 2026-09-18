@@ -27,7 +27,24 @@ python3 "$SCRIPT_DIR/analyze_stage10_mtp.py" \
   --max-acceptance-drop-pp "${MAX_ACC_DROP_PP:-3.0}" \
   --max-median-pp-loss "${MAX_PP_LOSS:-5.0}"
 
+# The steady-state A/B above uses cache_prompt=false by design. The previous
+# Flash-Next 0.1 t/s incident lived specifically in cached Large-PP / rollback,
+# so a throughput PASS is not enough. Run the high-LCP branch regression unless
+# explicitly disabled for a quick smoke.
+if [[ "${RUN_CACHED_STRESS:-1}" == "1" ]]; then
+  python3 "$SCRIPT_DIR/bench_stage10_cached_largepp.py" \
+    --baseline "$BASELINE" \
+    --r2 "$R2" \
+    --prefix-tokens "${CACHED_PREFIX_TOKENS:-16384}" \
+    --suffix-tokens "${CACHED_SUFFIX_TOKENS:-96}" \
+    --n-predict "${CACHED_N_PREDICT:-256}" \
+    --repeats "${CACHED_REPEATS:-2}" \
+    --absolute-tg-floor "${CACHED_TG_FLOOR:-5.0}" \
+    --min-self-retention "${CACHED_SELF_RETENTION:-0.50}" \
+    --max-vs-baseline-loss "${CACHED_MAX_BASELINE_LOSS:-5.0}"
+fi
+
 echo
 echo "Stage-10 MTP A/B complete."
 echo "Baseline and candidate share the same upstream HC lineage; the intended variable is PR #28243 MTP."
-echo "A PASS is still only a candidate result; cached Large-PP and long-context rollback/QSA regression must pass before production merge."
+echo "Promotion still requires the later long-context QSA/rollback combined-runtime regression before touching production."
