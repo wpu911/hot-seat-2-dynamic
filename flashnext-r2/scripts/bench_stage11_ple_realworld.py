@@ -5,10 +5,20 @@ PR #29030 exists because mmap demand paging of the huge qwen4exp PLE table can
 look deceptively good on repetitive benchmark prompts while real inputs touch
 many more PLE rows. A repeated seed string is therefore the wrong benchmark.
 
+The default four-leg design is two paired experiments with opposite order:
+
+    pair 0: mmap -> direct    (prompt set A)
+    pair 1: direct -> mmap    (prompt set B)
+
+Each pair uses the same disjoint prompt windows in both arms, while the second
+pair gets completely different windows. This avoids the particularly silly
+benchmark where every later leg re-reads the exact pages the first leg just
+warmed and then everyone congratulates the page cache.
+
 This runner:
   * reads recent local OpenClaw session text (content never leaves localhost);
   * tokenizes it once through llama-swap;
-  * cuts disjoint prompt windows for each repetition;
+  * cuts disjoint prompt windows for each pair/repetition;
   * reports 4-gram diversity so low-diversity tests cannot masquerade as proof;
   * alternates mmap/direct aliases and unloads between legs;
   * stores only metrics/hashes, never the session text itself.
@@ -191,18 +201,32 @@ def ngram_unique_ratio(ids: list[int], n: int = 4) -> float:
     return len({tuple(ids[i:i+n]) for i in range(total)}) / total
 
 
-def build_windows(ids: list[int], targets: list[int], repeats: int) -> dict[int, list[list[int]]]:
-    need = sum(t * repeats for t in targets) + 4096
+def paired_sequence(base: str, r2: str, rounds: int) -> list[tuple[str, int]]:
+    if rounds < 2 or rounds % 2 != 0:
+        raise ValueError("--rounds must be an even integer >= 2 for paired A/B")
+    out: list[tuple[str, int]] = []
+    for pair_id in range(rounds // 2):
+        # Reverse every other pair: AB, BA, AB, BA ...
+        order = (base, r2) if pair_id % 2 == 0 else (r2, base)
+        out.extend((model, pair_id) for model in order)
+    return out
+
+
+def build_windows(ids: list[int], targets: list[int], repeats: int, pair_count: int) -> dict[int, list[list[list[int]]]]:
+    need = sum(t * repeats * pair_count for t in targets) + 4096 + 257 * repeats * pair_count * len(targets)
     if len(ids) < need:
-        raise RuntimeError(f"corpus has {len(ids)} tokens but {need} are required for disjoint windows")
-    out: dict[int, list[list[int]]] = {}
+        raise RuntimeError(f"corpus has {len(ids)} tokens but {need} are required for disjoint paired windows")
+    out: dict[int, list[list[list[int]]]] = {}
     cursor = 1024
     for t in targets:
-        rows = []
-        for _ in range(repeats):
-            rows.append(ids[cursor:cursor+t])
-            cursor += t + 257  # offset boundaries so adjacent n-grams are not recycled
-        out[t] = rows
+        pairs: list[list[list[int]]] = []
+        for _pair in range(pair_count):
+            rows: list[list[int]] = []
+            for _ in range(repeats):
+                rows.append(ids[cursor:cursor+t])
+                cursor += t + 257
+            pairs.append(rows)
+        out[t] = pairs
     return out
 
 
@@ -253,7 +277,8 @@ def main():
     ap.add_argument("--max-files", type=int, default=24)
     ap.add_argument("--pp", default="512,2048,8192")
     ap.add_argument("--repeat", type=int, default=3)
-    ap.add_argument("--rounds", type=int, default=4)
+    ap.add_argument("--rounds", type=int, default=4,
+                    help="even number of legs; default 4 => AB on pair0, BA on pair1")
     ap.add_argument("--tg", type=int, default=128)
     ap.add_argument("--min-ngram4-ratio", type=float, default=0.70)
     ap.add_argument("--force", action="store_true")
@@ -264,6 +289,9 @@ def main():
     if not targets:
         raise RuntimeError("no PP targets")
 
+    seq = paired_sequence(args.baseline, args.r2, args.rounds)
+    pair_count = args.rounds // 2
+
     corpus, files = load_corpus(Path(args.sessions), args.max_files)
     source = "openclaw_sessions"
     synth_cursor = 0
@@ -272,19 +300,16 @@ def main():
         synth_cursor += 6000
         source = "synthetic_fallback"
 
-    # Tokenize corpus through baseline alias. Loading it here is intentional; it
-    # also proves the alias can start before we spend time on the full A/B.
     unload(args.url, args.baseline, args.force)
     unload(args.url, args.r2, args.force)
     ids = tokenize(args.url, args.baseline, corpus)
 
-    need = sum(t * args.repeat for t in targets) + 4096
+    need = sum(t * args.repeat * pair_count for t in targets) + 4096 + 257 * args.repeat * pair_count * len(targets)
     extension_rounds = 0
     while len(ids) < need:
         # Grow in bounded chunks rather than interpreting a token deficit as a
-        # row count. The old need*2 expression could generate tens of thousands
-        # of rows for a 36k-token benchmark, which is how tiny helpers become
-        # accidental RAM tests.
+        # row count. The old need*2 expression could turn a benchmark helper into
+        # an accidental RAM stress test.
         missing = need - len(ids)
         rows = max(1024, min(4096, missing // 8 + 256))
         corpus += "\n" + synthetic_fallback(rows, start=synth_cursor)
@@ -295,27 +320,41 @@ def main():
             raise RuntimeError(f"unable to build enough diverse corpus after {extension_rounds} bounded extensions")
         source += "+synthetic_extension"
 
-    windows = build_windows(ids, targets, args.repeat)
+    windows = build_windows(ids, targets, args.repeat, pair_count)
     diversity = {
-        str(t): [ngram_unique_ratio(w, 4) for w in windows[t]] for t in targets
+        str(t): [
+            [ngram_unique_ratio(w, 4) for w in windows[t][pair_id]]
+            for pair_id in range(pair_count)
+        ]
+        for t in targets
     }
-    worst_div = min(v for arr in diversity.values() for v in arr)
+    worst_div = min(v for pairs in diversity.values() for rows in pairs for v in rows)
     if worst_div < args.min_ngram4_ratio:
         raise RuntimeError(
             f"corpus 4-gram diversity too low: worst={worst_div:.4f} < {args.min_ngram4_ratio:.4f}; "
             "refusing a benchmark that can hide PLE I/O"
         )
 
-    # Convert every window once. Baseline/R2 use the same tokenizer/model family,
-    # so both arms receive byte-identical prompt text.
-    prompts = {str(t): [detokenize(args.url, args.baseline, w) for w in windows[t]] for t in targets}
+    # Convert every pair's windows once. The two arms in a pair get byte-identical
+    # prompt text; different pairs never reuse the same token window.
+    prompts: dict[str, list[list[str]]] = {}
+    for t in targets:
+        prompts[str(t)] = []
+        for pair_id in range(pair_count):
+            prompts[str(t)].append([
+                detokenize(args.url, args.baseline, w) for w in windows[t][pair_id]
+            ])
     unload(args.url, args.baseline, args.force)
 
-    sequence = [args.baseline if i % 2 == 0 else args.r2 for i in range(args.rounds)]
     report = {
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "url": args.url,
-        "sequence": sequence,
+        "sequence": [model for model, _ in seq],
+        "pair_ids": [pair_id for _, pair_id in seq],
+        "pair_order": [
+            {"pair_id": p, "order": [args.baseline, args.r2] if p % 2 == 0 else [args.r2, args.baseline]}
+            for p in range(pair_count)
+        ],
         "corpus": {
             "source": source,
             "files_used": len(files),
@@ -334,13 +373,14 @@ def main():
         ("tool", "分析一个本地模型服务出现吞吐下降时，应依次检查哪些运行指标、缓存状态和 GPU 调度信息。"),
     ]
 
-    for li, model in enumerate(sequence, 1):
+    for li, (model, pair_id) in enumerate(seq, 1):
         unload(args.url, args.baseline, args.force)
         unload(args.url, args.r2, args.force)
         time.sleep(3)
-        print(f"\n=== Stage11 real-world leg {li}/{len(sequence)} model={model} ===", flush=True)
+        print(f"\n=== Stage11 real-world leg {li}/{len(seq)} pair={pair_id} model={model} ===", flush=True)
         leg = {
             "model": model,
+            "pair_id": pair_id,
             "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "running_before": optional(args.url, "/running"),
             "pp": {},
@@ -348,12 +388,14 @@ def main():
         }
         for t in targets:
             rows = []
-            for ri, prompt in enumerate(prompts[str(t)]):
+            for ri, prompt in enumerate(prompts[str(t)][pair_id]):
                 row = completion(args.url, model, prompt, 1)
                 row["variant"] = ri
-                row["ngram4_unique_ratio"] = diversity[str(t)][ri]
+                row["pair_id"] = pair_id
+                row["ngram4_unique_ratio"] = diversity[str(t)][pair_id][ri]
                 rows.append(row)
                 print(json.dumps({
+                    "pair": pair_id,
                     "target": t,
                     "variant": ri,
                     "prompt_n": row["prompt_n"],
@@ -365,6 +407,7 @@ def main():
         for name, prompt in tg_workloads:
             row = completion(args.url, model, prompt, args.tg)
             row["workload"] = name
+            row["pair_id"] = pair_id
             leg["tg"].append(row)
 
         leg["running_after"] = optional(args.url, "/running")
