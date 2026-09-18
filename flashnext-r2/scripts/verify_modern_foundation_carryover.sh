@@ -60,10 +60,15 @@ else
   echo "INFO   QSA gather is not present in foundation; Stage 7 remains a valid independent experiment."
 fi
 
-# #28569 re-enables -sm tensor. It is deliberately informational here, not a
-# carry-over requirement: heterogeneous gfx1100+gfx1201 tensor splitting can add
-# inter-device traffic and must be benchmarked separately if we ever enable it.
-if grep -A8 -B8 'bool llm_arch_supports_sm_tensor' "$SRC/src/llama-arch.cpp" | grep -q 'LLM_ARCH_QWEN4EXP'; then
+# #28569 re-enables -sm tensor. Scope the probe to exactly that function; a plain
+# grep around the function header is too short because the unsupported-arch switch
+# is long enough to make archaeology out of eight context lines.
+SM_TENSOR_FUNC="$(awk '
+  /bool llm_arch_supports_sm_tensor[[:space:]]*\(/ { in_fn=1 }
+  in_fn { print }
+  in_fn && /^}/ { exit }
+' "$SRC/src/llama-arch.cpp")"
+if grep -q 'LLM_ARCH_QWEN4EXP' <<<"$SM_TENSOR_FUNC"; then
   echo "INFO   qwen4exp -sm tensor is disabled in this foundation; #28569 remains an optional experiment, not a missing fix."
 else
   echo "INFO   qwen4exp -sm tensor appears enabled; verify scheduler placement before any tensor-split A/B."
