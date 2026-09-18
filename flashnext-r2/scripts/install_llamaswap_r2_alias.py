@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Clone the live Flash Next llama-swap block into an R2 test alias.
+
+No YAML dependency is required. The script works on the existing config text so it
+preserves every production model/draft/HotSeat/MTP argument verbatim and changes
+only the fields explicitly requested for R2.
+
+Default source config:
+  /app/share/llama_box/config/config-rocm714.yaml
+
+Default aliases:
+  qwen3.8-flash-next:256k       -> qwen3.8-flash-next-r2:256k
+
+Default R2 runtime:
+  /app/share/llm/Qwen3.8-Flash-Next-GGUF/runtime-text/r2-stage1/bin
+
+It creates a timestamped backup next to /app/share/backup and refuses to overwrite
+an existing R2 alias unless --replace is supplied.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+SRC_ALIAS = "qwen3.8-flash-next:256k"
+DST_ALIAS = "qwen3.8-flash-next-r2:256k"
+CONFIG = "/app/share/llama_box/config/config-rocm714.yaml"
+R2_BIN = "/app/share/llm/Qwen3.8-Flash-Next-GGUF/runtime-text/r2-stage1/bin"
+BACKUP_ROOT = "/app/share/backup"
+
+
+def find_block(lines: list[str], alias: str) -> tuple[int, int, int]:
+    pat = re.compile(r"^(\s*)" + re.escape(alias) + r":\s*(?:#.*)?$")
+    for i, line in enumerate(lines):
+        m = pat.match(line.rstrip("\n"))
+        if not m:
+            continue
+        indent = len(m.group(1))
+        j = i + 1
+        while j < len(lines):
+            s = lines[j]
+            if s.strip() and not s.lstrip().startswith("#"):
+                leading = len(s) - len(s.lstrip(" "))
+                # Same or smaller indentation marks the next YAML key outside block.
+                if leading <= indent:
+                    break
+            j += 1
+        return i, j, indent
+    raise RuntimeError(f"alias not found: {alias}")
+
+
+def replace_runtime(block: str, r2_bin: str) -> tuple[str, str | None]:
+    # Find the actual llama-server executable in the cloned production block.
+    m = re.search(r"(?m)^\s*(/\S*/llama-server)\s*$", block)
+    old_server = m.group(1) if m else None
+    if old_server:
+        old_bin = str(Path(old_server).parent)
+        block = block.replace(old_bin, r2_bin)
+    else:
+        # Fall back to replacement of any explicit runtime-text/.../bin path.
+        block, n = re.subn(
+            r"/app/share/llm/Qwen3\.8-Flash-Next-GGUF/runtime-text/[^\s\"']+/bin",
+            r2_bin,
+            block,
+        )
+        if n == 0:
+            raise RuntimeError("could not locate Flash Next runtime bin path in source block")
+    return block, old_server
+
+
+def inject_env(block: str, indent: int, key: str, value: str) -> str:
+    # Replace existing entry if present.
+    env_pat = re.compile(rf'(?m)^(\s*)-\s*["\']?{re.escape(key)}=[^\n"\']*["\']?\s*$')
+    if env_pat.search(block):
+        return env_pat.sub(lambda m: f'{m.group(1)}- "{key}={value}"', block, count=1)
+
+    lines = block.splitlines(True)
+    env_i = None
+    for i, line in enumerate(lines):
+        if re.match(rf"^\s{{{indent+2}}}env:\s*$", line.rstrip("\n")):
+            env_i = i
+            break
+    if env_i is None:
+        raise RuntimeError("source alias has no env: block; refusing to invent layout")
+
+    item_indent = " " * (indent + 4)
+    lines.insert(env_i + 1, f'{item_indent}- "{key}={value}"\n')
+    return "".join(lines)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=CONFIG)
+    ap.add_argument("--source-alias", default=SRC_ALIAS)
+    ap.add_argument("--alias", default=DST_ALIAS)
+    ap.add_argument("--r2-bin", default=R2_BIN)
+    ap.add_argument("--jmax", default="32")
+    ap.add_argument("--replace", action="store_true")
+    ap.add_argument("--validate", action="store_true", help="run llama-swap -validate after writing")
+    args = ap.parse_args()
+
+    p = Path(args.config)
+    text = p.read_text(encoding="utf-8")
+    lines = text.splitlines(True)
+
+    try:
+        s0, s1, indent = find_block(lines, args.source_alias)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        d0, d1, _ = find_block(lines, args.alias)
+        if not args.replace:
+            print(f"ERROR: destination alias already exists: {args.alias}; use --replace", file=sys.stderr)
+            return 3
+        del lines[d0:d1]
+        # Source indices may shift if destination was before source.
+        text = "".join(lines)
+        lines = text.splitlines(True)
+        s0, s1, indent = find_block(lines, args.source_alias)
+    except RuntimeError:
+        pass
+
+    block = "".join(lines[s0:s1])
+    block = re.sub(
+        r"^(\s*)" + re.escape(args.source_alias) + r":",
+        lambda m: m.group(1) + args.alias + ":",
+        block,
+        count=1,
+        flags=re.M,
+    )
+    block, old_server = replace_runtime(block, args.r2_bin)
+    block = inject_env(block, indent, "GGML_JOHNV8_MMQ_ID_JMAX", args.jmax)
+
+    # Add a comment that makes the experimental nature obvious in the live config.
+    comment = " " * indent + "# Flash Next R2 experimental alias: production block cloned verbatim; only runtime/JMAX differ\n"
+    block = comment + block
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir = Path(BACKUP_ROOT) / f"flashnext-r2-alias-before-{stamp}"
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    shutil.copy2(p, backup_dir / p.name)
+
+    # Insert immediately after source block, keeping source production alias untouched.
+    lines[s1:s1] = ["\n", block]
+    tmp = p.with_suffix(p.suffix + ".r2tmp")
+    tmp.write_text("".join(lines), encoding="utf-8")
+    os.replace(tmp, p)
+
+    print(f"OK backup={backup_dir}")
+    print(f"OK source_alias={args.source_alias}")
+    print(f"OK r2_alias={args.alias}")
+    print(f"OK r2_bin={args.r2_bin}")
+    print(f"OK JMAX={args.jmax}")
+    if old_server:
+        print(f"INFO production_server_preserved_in_source={old_server}")
+
+    if args.validate:
+        swap = "/app/share/llama_box/bin/llama-swap"
+        if not Path(swap).exists():
+            print(f"ERROR: validator not found: {swap}", file=sys.stderr)
+            return 4
+        r = subprocess.run([swap, "-config", str(p), "-validate"], text=True)
+        if r.returncode:
+            print("ERROR: llama-swap validation failed; restore backup before reload", file=sys.stderr)
+            return r.returncode
+        print("OK llama-swap validation passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
