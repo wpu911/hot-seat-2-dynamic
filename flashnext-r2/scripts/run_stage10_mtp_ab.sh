@@ -3,11 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# Stage 10 must isolate MTP. The baseline is therefore the Stage-12 HC-only
-# runtime, not production. Candidate = the same HC stack + PR #28243.
-BASELINE="${BASELINE:-qwen3.8-flash-next-r2-upstream-hc:256k}"
-R2="${R2:-qwen3.8-flash-next-r2-hc-mtp:256k}"
-OUT="${OUT:-/app/share/openclaw_tools/logs/flashnext-r2-stage10-hc-vs-hc-mtp.json}"
+# Corrected Stage 10 isolates PR #28243 against the COMPLETE Sep18 modern
+# foundation, not the retired Sep11+selected-HC approximation.
+BASELINE="${BASELINE:-qwen3.8-flash-next-r2-modern-foundation:256k}"
+R2="${R2:-qwen3.8-flash-next-r2-modern-mtp:256k}"
+OUT="${OUT:-/app/share/openclaw_tools/logs/flashnext-r2-stage10-foundation-vs-modern-mtp.json}"
 
 python3 "$SCRIPT_DIR/bench_llamaswap_ab.py" \
   --baseline "$BASELINE" \
@@ -27,10 +27,9 @@ python3 "$SCRIPT_DIR/analyze_stage10_mtp.py" \
   --max-acceptance-drop-pp "${MAX_ACC_DROP_PP:-3.0}" \
   --max-median-pp-loss "${MAX_PP_LOSS:-5.0}"
 
-# The steady-state A/B above uses cache_prompt=false by design. The previous
-# Flash-Next 0.1 t/s incident lived specifically in cached Large-PP / rollback,
-# so a throughput PASS is not enough. Run the high-LCP branch regression unless
-# explicitly disabled for a quick smoke.
+# The old 0.1 t/s failure lived in cached Large-PP / speculative rollback, not in
+# a fresh cache_prompt=false microbench. Keep this regression gate mandatory by
+# default before any promotion discussion.
 if [[ "${RUN_CACHED_STRESS:-1}" == "1" ]]; then
   python3 "$SCRIPT_DIR/bench_stage10_cached_largepp.py" \
     --baseline "$BASELINE" \
@@ -45,6 +44,6 @@ if [[ "${RUN_CACHED_STRESS:-1}" == "1" ]]; then
 fi
 
 echo
-echo "Stage-10 MTP A/B complete."
-echo "Baseline and candidate share the same upstream HC lineage; the intended variable is PR #28243 MTP."
-echo "Promotion still requires the later long-context QSA/rollback combined-runtime regression before touching production."
+echo "Stage-10 modern-MTP A/B complete."
+echo "Baseline and candidate now share the full Sep18 upstream + exact production overlay lineage."
+echo "The intended variable is PR #28243 only."
