@@ -20,8 +20,11 @@ an existing R2 alias unless --replace is supplied.
 Additional experiment switches may be supplied repeatedly with:
   --env KEY=VALUE
 
-Example:
-  --env GGML_JOHNV8_HC_FUSE=1 --env GGML_JOHNV8_MIX_FUSE=1
+MTP sweep aliases can override only the existing production argument with:
+  --spec-draft-n-max N
+
+The MTP option must already exist in the cloned production block. The script will
+not invent a speculative-decoding command line for a model that does not have one.
 """
 from __future__ import annotations
 
@@ -77,6 +80,17 @@ def replace_runtime(block: str, r2_bin: str) -> tuple[str, str | None]:
     return block, old_server
 
 
+def replace_existing_cli_option(block: str, option: str, value: str) -> str:
+    pat = re.compile(rf"({re.escape(option)}\s+)(\S+)")
+    matches = list(pat.finditer(block))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected exactly one existing {option} in cloned block, found {len(matches)}; "
+            "refusing to invent or ambiguously edit command line"
+        )
+    return pat.sub(lambda m: m.group(1) + value, block, count=1)
+
+
 def inject_env(block: str, indent: int, key: str, value: str) -> str:
     env_pat = re.compile(rf'(?m)^(\s*)-\s*["\']?{re.escape(key)}=[^\n"\']*["\']?\s*$')
     if env_pat.search(block):
@@ -117,9 +131,14 @@ def main() -> int:
     ap.add_argument("--r2-bin", default=R2_BIN)
     ap.add_argument("--jmax", default="32")
     ap.add_argument("--env", action="append", default=[], help="extra KEY=VALUE override; repeatable")
+    ap.add_argument("--spec-draft-n-max", type=int, default=None, help="replace existing --spec-draft-n-max value")
     ap.add_argument("--replace", action="store_true")
     ap.add_argument("--validate", action="store_true", help="run llama-swap -validate after writing")
     args = ap.parse_args()
+
+    if args.spec_draft_n_max is not None and not (1 <= args.spec_draft_n_max <= 16):
+        print("ERROR: --spec-draft-n-max must be in 1..16", file=sys.stderr)
+        return 1
 
     try:
         extra_env = parse_env(args.env)
@@ -157,12 +176,20 @@ def main() -> int:
         count=1,
         flags=re.M,
     )
-    block, old_server = replace_runtime(block, args.r2_bin)
+
+    try:
+        block, old_server = replace_runtime(block, args.r2_bin)
+        if args.spec_draft_n_max is not None:
+            block = replace_existing_cli_option(block, "--spec-draft-n-max", str(args.spec_draft_n_max))
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 5
+
     block = inject_env(block, indent, "GGML_JOHNV8_MMQ_ID_JMAX", args.jmax)
     for key, value in extra_env:
         block = inject_env(block, indent, key, value)
 
-    comment = " " * indent + "# Flash Next R2 experimental alias: cloned from production; only runtime/explicit env overrides differ\n"
+    comment = " " * indent + "# Flash Next R2 experimental alias: cloned from production; only runtime/explicit overrides differ\n"
     block = comment + block
 
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -180,6 +207,8 @@ def main() -> int:
     print(f"OK r2_alias={args.alias}")
     print(f"OK r2_bin={args.r2_bin}")
     print(f"OK JMAX={args.jmax}")
+    if args.spec_draft_n_max is not None:
+        print(f"OK --spec-draft-n-max={args.spec_draft_n_max}")
     for key, value in extra_env:
         print(f"OK env {key}={value}")
     if old_server:
