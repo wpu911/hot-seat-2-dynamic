@@ -21,7 +21,6 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import statistics
 import time
 import urllib.parse
 import urllib.request
@@ -167,13 +166,14 @@ def load_corpus(root: Path, max_files: int) -> tuple[str, list[str]]:
     return "\n\n".join(chunks), used
 
 
-def synthetic_fallback(n: int = 12000) -> str:
+def synthetic_fallback(n: int = 6000, start: int = 0) -> str:
     # Deliberately varied fallback, not one sentence repeated 10,000 times.
     subjects = ["bank-ledger", "container", "kernel", "invoice", "router", "warehouse", "scheduler", "checkpoint"]
     verbs = ["reconciles", "indexes", "validates", "streams", "compares", "restores", "routes", "profiles"]
     attrs = ["timestamp", "amount", "token", "sequence", "expert", "position", "checksum", "latency", "account"]
     rows = []
-    for i in range(n):
+    for j in range(n):
+        i = start + j
         a = subjects[i % len(subjects)]
         b = verbs[(i * 5 + 3) % len(verbs)]
         c = attrs[(i * 7 + 1) % len(attrs)]
@@ -214,6 +214,7 @@ def completion(url: str, model: str, prompt: str, n_predict: int):
         "temperature": 0,
         "seed": 1234,
         "cache_prompt": False,
+        "ignore_eos": True,
         "stream": False,
     }
     t0 = time.time()
@@ -265,8 +266,10 @@ def main():
 
     corpus, files = load_corpus(Path(args.sessions), args.max_files)
     source = "openclaw_sessions"
+    synth_cursor = 0
     if not corpus:
-        corpus = synthetic_fallback()
+        corpus = synthetic_fallback(start=synth_cursor)
+        synth_cursor += 6000
         source = "synthetic_fallback"
 
     # Tokenize corpus through baseline alias. Loading it here is intentional; it
@@ -276,9 +279,20 @@ def main():
     ids = tokenize(args.url, args.baseline, corpus)
 
     need = sum(t * args.repeat for t in targets) + 4096
-    if len(ids) < need:
-        corpus += "\n" + synthetic_fallback(max(12000, need * 2))
+    extension_rounds = 0
+    while len(ids) < need:
+        # Grow in bounded chunks rather than interpreting a token deficit as a
+        # row count. The old need*2 expression could generate tens of thousands
+        # of rows for a 36k-token benchmark, which is how tiny helpers become
+        # accidental RAM tests.
+        missing = need - len(ids)
+        rows = max(1024, min(4096, missing // 8 + 256))
+        corpus += "\n" + synthetic_fallback(rows, start=synth_cursor)
+        synth_cursor += rows
+        extension_rounds += 1
         ids = tokenize(args.url, args.baseline, corpus)
+        if extension_rounds > 8:
+            raise RuntimeError(f"unable to build enough diverse corpus after {extension_rounds} bounded extensions")
         source += "+synthetic_extension"
 
     windows = build_windows(ids, targets, args.repeat)
