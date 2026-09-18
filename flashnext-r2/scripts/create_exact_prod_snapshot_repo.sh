@@ -78,8 +78,21 @@ git -C "$PROD_SRC" status --short > "$SNAP/r2-snapshot-meta/production-status.tx
   echo "untracked_source_count=$(wc -l < "$UNTRACKED")"
 } > "$SNAP/r2-snapshot-meta/manifest.txt"
 
-# Commit the reproduced state so every downstream `worktree add ... HEAD` includes
-# the local HotSeat modifications. The commit is local to this snapshot repo only.
+# Keep the usage note INSIDE the snapshot commit. The previous version wrote this
+# after committing, which made the supposedly immutable snapshot immediately dirty
+# and blocked prepare_modern_foundation.sh.
+cat > "$SNAP/USE_AS_PROD_SRC.txt" <<EOF
+SNAPSHOT=$SNAP
+ORIGINAL_PRODUCTION=$PROD_SRC
+ORIGINAL_HEAD=$HEAD_SHA
+
+Use this snapshot as PROD_SRC / EXACT_SRC for Flash Next R2 prepare scripts.
+Run 'git rev-parse HEAD' inside the snapshot when the snapshot commit id is needed.
+It contains the original committed HEAD plus the live tracked/untracked source edits.
+EOF
+
+# Commit the reproduced state so every downstream worktree/clone includes the local
+# HotSeat modifications and the snapshot metadata without leaving a dirty working tree.
 git -C "$SNAP" add -A
 git -C "$SNAP" \
   -c user.name='FlashNext R2 Snapshot' \
@@ -88,11 +101,12 @@ git -C "$SNAP" \
 
 SNAP_HEAD="$(git -C "$SNAP" rev-parse HEAD)"
 
-# Verify every path modified relative to the original HEAD byte-for-byte against
-# the live production tree. This includes newly added source files.
+# Verify every production-source path modified relative to the original HEAD
+# byte-for-byte against the live production tree. Snapshot-only metadata is excluded.
 mapfile -t CHANGED < <(git -C "$SNAP" diff-tree --no-commit-id --name-only -r "$SNAP_HEAD")
 for rel in "${CHANGED[@]}"; do
   [[ "$rel" == r2-snapshot-meta/* ]] && continue
+  [[ "$rel" == USE_AS_PROD_SRC.txt ]] && continue
   if [[ -e "$PROD_SRC/$rel" && -e "$SNAP/$rel" ]]; then
     if ! cmp -s "$PROD_SRC/$rel" "$SNAP/$rel"; then
       echo "ERROR: snapshot differs from production: $rel" >&2
@@ -106,22 +120,19 @@ for rel in "${CHANGED[@]}"; do
   fi
 done
 
-cat > "$SNAP/USE_AS_PROD_SRC.txt" <<EOF
-SNAPSHOT=$SNAP
-SNAPSHOT_HEAD=$SNAP_HEAD
-ORIGINAL_PRODUCTION=$PROD_SRC
-ORIGINAL_HEAD=$HEAD_SHA
-
-Use this snapshot as PROD_SRC / EXACT_SRC for Flash Next R2 prepare scripts.
-It contains the original committed HEAD plus the live tracked/untracked source edits.
-EOF
+DIRTY="$(git -C "$SNAP" status --porcelain)"
+if [[ -n "$DIRTY" ]]; then
+  echo "ERROR: exact snapshot is dirty after creation:" >&2
+  printf '%s\n' "$DIRTY" >&2
+  exit 12
+fi
 
 # Stable pointer for downstream scripts. Never replace a real directory named
 # "current" automatically; only create/update a symlink. Relative link keeps the
 # snapshot root relocatable as a unit.
 if [[ -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]]; then
   echo "ERROR: current snapshot pointer exists and is not a symlink: $CURRENT_LINK" >&2
-  exit 12
+  exit 13
 fi
 ln -sfn "$(basename "$SNAP")" "$CURRENT_LINK"
 
@@ -130,11 +141,11 @@ CURRENT_REAL="$(readlink -f "$CURRENT_LINK")"
 SNAP_REAL="$(readlink -f "$SNAP")"
 [[ "$CURRENT_REAL" == "$SNAP_REAL" ]] || {
   echo "ERROR: current snapshot pointer mismatch: $CURRENT_REAL != $SNAP_REAL" >&2
-  exit 13
+  exit 14
 }
 
 echo
 echo "SNAPSHOT=$SNAP"
 echo "SNAPSHOT_HEAD=$SNAP_HEAD"
 echo "CURRENT=$CURRENT_LINK"
-echo "Snapshot is clean: $(git -C "$SNAP" status --porcelain | wc -l) dirty entries"
+echo "Snapshot is clean: 0 dirty entries"
