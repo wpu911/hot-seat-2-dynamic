@@ -73,7 +73,7 @@ ALIAS=qwen3.8-flash-next-r2-modern-foundation:256k \
 bash flashnext-r2/scripts/verify_qwen4exp_native_rs_rollback.sh
 ```
 
-旧的“把 speculative checkpoint 搬到 GPU”的 #28118 路线**不采用**。原因不是它不快，而是 qwen4exp 已经有更正确的 native rollback，而且 #28118 仍有 multi-range hard abort / prompt-cache restore 风险。不要把已经消失的 checkpoint 再搬回 GPU，这属于优化界的还魂术。
+旧的“把 speculative checkpoint 搬到 GPU”的 #28118 路线**不采用**。qwen4exp 已经有更正确的 native rollback，而且 #28118 仍有 multi-range hard abort / prompt-cache restore 风险。不要把已经消失的 checkpoint 再搬回 GPU，这属于优化界的还魂术。
 
 ---
 
@@ -226,24 +226,17 @@ HIP Graph ON / OFF
 
 ---
 
-## 6. Phase 5：仅剩的 RDNA4/GDN microfusion
+## 6. Phase 5：仅剩的 GDN microfusion
 
 现代 upstream 已经有 qwen4exp HC fused ops 和 fused GDN，所以不再整包移植 JohnTDI stack。
 
-只隔离测试仍然独立的：
+只隔离测试：
 
 ```text
 E7   GDN prolog
-     sigmoid(beta)
-     softplus(alpha + dt) * A
-     收进 GDN kernel
-
 E7b  q/k L2 norm 收进 GDN kernel
-
 E7b2 FMA accumulation selector
 ```
-
-准备：
 
 ```bash
 bash flashnext-r2/scripts/prepare_phase5_gdn_microfusion.sh
@@ -258,18 +251,94 @@ PROLOG only
 PROLOG + L2
 ```
 
-先普通 PP/TG exact A/B。候选若胜出，还必须再过：
-
-```text
-16K cached Large-PP / high-LCP
-64K rollback stress
-```
-
-`gfx1201` 的数值兼容修改继续保留，不能把针对 R9700 验过的 intrinsic 行为盲目套给 gfx1100。
+候选若胜出，还必须过 16K cached Large-PP / high-LCP 与 64K rollback stress。
 
 ---
 
-## 7. Modern Foundation 已经有，不再重复搬的东西
+## 7. Phase 6：qwen4exp 双卡 Tensor Split #28569
+
+当前异构双卡为 gfx1100 + gfx1201。此前 layer split 的 Flash Next 双卡吞吐没有恢复到历史单卡 18–19 t/s，因此现在把 upstream #28569 作为**独立实验变量**，不再直接排除。
+
+#28569 只做两件关键事：
+
+```text
+允许 LLM_ARCH_QWEN4EXP 使用 --split-mode tensor
+qwen4exp hc_init 后强制 ggml_build_forward_expand(gf, res_hc)
+```
+
+第一轮严格使用 upstream ROCm 用户已经实际跑过的 1,1：
+
+```bash
+bash flashnext-r2/scripts/prepare_phase6_tensor_split.sh
+bash flashnext-r2/scripts/run_phase6_tensor_split_ab.sh
+```
+
+同一个真实 ELF，仅 wrapper 区分：
+
+```text
+LAYER
+  --split-mode layer
+
+TENSOR 1,1
+  --split-mode tensor
+  --tensor-split 1,1
+  --fit off
+```
+
+这里 `--fit off` 是硬要求。llama.cpp 当前明确没有为 SPLIT_MODE_TENSOR 实现 auto-fit。让一个“不支持”的自动功能替你管理两张不同容量显卡，属于典型的人类乐观主义。
+
+Phase 6 四关：
+
+```text
+短上下文 exact + 非灾难性回退
+4K / 32K / 64K / 128K retrieval + TG
+16K cached Large-PP / high-LCP
+64K recurrent rollback / MTP
+```
+
+只有 tensor 1,1 在深上下文 median TG 至少 +2% 且其余 gate 全过，才进入 Phase 6b。
+
+### 7.1 Phase 6b：异构显存比例自动 sweep
+
+因为 7900 XTX 与 R9700 容量不同，1,1 不是最终结论。Phase 6b 读取**候选 binary 自己的 `--list-devices` 输出**以及 alias 的实际 `--device` 顺序，不猜 ROCm0/ROCm1 谁是谁。
+
+```bash
+bash flashnext-r2/scripts/prepare_phase6b_tensor_ratio_sweep.sh
+bash flashnext-r2/scripts/run_phase6b_tensor_ratio_sweep.sh
+```
+
+对两张卡自动生成：
+
+```text
+EVEN  1,1
+MID   等分与容量比例之间的中间比例
+CAP   按总 VRAM 容量比例
+```
+
+若设备顺序是 24 GiB → 32 GiB，典型会近似：
+
+```text
+EVEN  1,1
+MID   13,15 左右
+CAP   3,4 左右
+```
+
+若设备顺序反过来，比例自动反过来。这里使用**总 VRAM**而不是当时 free VRAM，因为 free VRAM 可能正被其他已加载模型污染。
+
+Phase 6b 先只跑 MID/CAP 的 32K/64K smoke，选出较好的正收益候选，再做：
+
+```text
+short exact A/B
+32K / 64K / 128K 四轮确认
+cached Large-PP
+64K rollback
+```
+
+最终 ratio 若连 +1% 的重复长上下文 median TG 都站不住，就保留 1,1，不为一个统计噪声多养两套配置。
+
+---
+
+## 8. Modern Foundation 已经有，不再重复搬的东西
 
 ```text
 qwen4exp native recurrent rollback #28123
@@ -298,9 +367,6 @@ broadcast Q8 quantize/scatter dedup
 CUDA sparse FA #28770
   NVIDIA 路线，不直接套 HIP。
 
--sm tensor #28569
-  没有针对当前 gfx1100 + gfx1201 HIP 异构双卡完成验证，不混入当前主线。
-
 多 stream fork/join
   过去 ROCm 同步代价过高。
 
@@ -308,9 +374,11 @@ wave64 强开
   不拿兼容性换 benchmark 截图。
 ```
 
+`-sm tensor #28569` 已从“暂不走”移入 Phase 6，但仍是实验路线，绝不在 A/B 之前直接改生产。
+
 ---
 
-## 8. 最终生产切换条件
+## 9. 最终生产切换条件
 
 只有最终候选同时满足：
 
@@ -323,6 +391,7 @@ native recurrent rollback 确认启用
 cached Large-PP 不再出现 0.1 t/s 类退化
 rollback / seq_rm / prefix reuse 正常
 OpenClaw 实际 session 路径正常
+若 tensor split 胜出，其设备顺序和 tensor ratio 已明确记录
 ```
 
 才允许替换：
