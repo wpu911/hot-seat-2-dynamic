@@ -208,8 +208,13 @@ if [[ -x "$BUILD/bin/test-backend-ops" ]]; then
     || "$BUILD/bin/test-backend-ops" test -o TOP_K
 fi
 
-mkdir -p "$RUNTIME"
-cp -a "$BUILD/bin/." "$RUNTIME/"
+# Keep the candidate independent from its CMake tree. Hashes are recorded only
+# after RUNPATH normalization, so a later build cleanup cannot silently change
+# which libllama/libggml this alias loads.
+REQUIRE_BOTH_GPUS="${REQUIRE_BOTH_GPUS:-1}" \
+  bash "$SCRIPT_DIR/stage_runtime_bundle.sh" \
+    "$BUILD/bin" "$RUNTIME" "$R2_SRC/r2-meta/runtime-bundle"
+
 sha256sum "$RUNTIME/llama-server" | tee r2-meta/stage10-llama-server.sha256
 "$RUNTIME/llama-server" --version | tee r2-meta/stage10-version.txt || true
 
