@@ -6,10 +6,7 @@ MTP throughput. That does NOT exercise the production failure mode seen on
 2026-09-11, where a cached high-LCP request crossed a Large-PP ownership boundary
 and speculative multi-row verification collapsed to ~0.1 tok/s.
 
-This test compares:
-  Stage-12 HC-only baseline
-  Stage-10 same HC stack + upstream PR #28243 MTP
-
+This test compares the modern foundation baseline with the modern-MTP candidate.
 For each model it:
   1. unloads the alias;
   2. fills a long prompt with cache_prompt=true;
@@ -17,6 +14,8 @@ For each model it:
      reuse / rollback rather than a clean fresh decode;
   4. records PP, TG, wall time, cache counters when exposed, and MTP acceptance.
 
+TG is fixed-length with ignore_eos=true. Current llama-server speculative counters
+are read from timings.draft_n / timings.draft_n_accepted, with legacy fallbacks.
 It never unloads unrelated models and never modifies llama-swap configuration.
 """
 from __future__ import annotations
@@ -27,11 +26,11 @@ from pathlib import Path
 import statistics
 import time
 
-from bench_llamaswap_ab import http_json, unload_model, exact_prompt
+from bench_llamaswap_ab import http_json, unload_model, exact_prompt, speculative_counts
 
 URL = "http://127.0.0.1:8090"
-BASE = "qwen3.8-flash-next-r2-upstream-hc:256k"
-R2 = "qwen3.8-flash-next-r2-hc-mtp:256k"
+BASE = "qwen3.8-flash-next-r2-modern-foundation:256k"
+R2 = "qwen3.8-flash-next-r2-modern-mtp:256k"
 
 
 def pick(d, keys):
@@ -52,25 +51,39 @@ def completion(base_url: str, model: str, prompt: str, n_predict: int):
         "seed": 1234,
         "cache_prompt": True,
         "stream": False,
+        "ignore_eos": True,
     }
     t0 = time.time()
     r = http_json("POST", base_url + "/completion", payload, timeout=3600)
     wall = time.time() - t0
-    timings = r.get("timings", {}) if isinstance(r, dict) else {}
-    drafted = pick(r, ("drafted_n", "tokens_drafted", "n_drafted"))
-    accepted = pick(r, ("drafted_n_accepted", "tokens_drafted_accepted", "n_drafted_accepted"))
-    cache_n = pick(r, ("tokens_cached", "n_cached", "cache_n", "prompt_cached_n"))
+    if not isinstance(r, dict):
+        raise RuntimeError(f"unexpected completion response: {type(r)}")
+    timings = r.get("timings", {}) or {}
+    drafted, accepted = speculative_counts(r, timings)
+    # Cache counters have moved across server revisions. Prefer timings if present,
+    # then fall back to the top-level compatibility names.
+    cache_n = pick(timings, ("tokens_cached", "n_cached", "cache_n", "prompt_cached_n"))
+    if cache_n is None:
+        cache_n = pick(r, ("tokens_cached", "n_cached", "cache_n", "prompt_cached_n"))
+    predicted_n = timings.get("predicted_n")
+    full_generation = isinstance(predicted_n, (int, float)) and predicted_n >= n_predict
+    if not full_generation:
+        raise RuntimeError(
+            f"{model}: cached TG requested {n_predict} tokens but server reported predicted_n={predicted_n}; "
+            "refusing to trust a short early-EOS timing"
+        )
     return {
         "wall_s": wall,
         "prompt_n": timings.get("prompt_n"),
         "pp": timings.get("prompt_per_second"),
-        "predicted_n": timings.get("predicted_n"),
+        "predicted_n": predicted_n,
         "tg": timings.get("predicted_per_second"),
         "drafted": drafted,
         "accepted": accepted,
         "acceptance": (accepted / drafted) if isinstance(drafted, (int, float)) and drafted > 0 and isinstance(accepted, (int, float)) else None,
         "cache_n": cache_n,
-        "content": r.get("content", "") if isinstance(r, dict) else str(r),
+        "full_generation": full_generation,
+        "content": r.get("content", ""),
     }
 
 
@@ -97,7 +110,8 @@ def run_model(base_url: str, model: str, prefix_tokens: int, suffix_tokens: int,
     prefix = exact_prompt(base_url, model, prefix_tokens)
     suffix = suffix_text(base_url, model, suffix_tokens)
 
-    fresh = completion(base_url, model, prefix, max(64, min(128, n_predict)))
+    fresh_predict = max(64, min(128, n_predict))
+    fresh = completion(base_url, model, prefix, fresh_predict)
 
     # Deliberately branch from the cached prefix instead of appending the first
     # generation. This forces the cache/rollback path that previously exposed
@@ -109,6 +123,8 @@ def run_model(base_url: str, model: str, prefix_tokens: int, suffix_tokens: int,
         "model": model,
         "prefix_tokens_target": prefix_tokens,
         "suffix_tokens_target": suffix_tokens,
+        "fresh_predict": fresh_predict,
+        "branch_predict": n_predict,
         "fresh": fresh,
         "branch": branch,
     }
@@ -140,7 +156,7 @@ def main():
     ap.add_argument("--min-self-retention", type=float, default=0.50,
                     help="branch TG must retain this fraction of the same model's fresh TG")
     ap.add_argument("--max-vs-baseline-loss", type=float, default=5.0,
-                    help="candidate branch median may not trail HC-only baseline by more than this percent")
+                    help="candidate branch median may not trail baseline by more than this percent")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--out", default="/app/share/openclaw_tools/logs/flashnext-stage10-cached-largepp.json")
     args = ap.parse_args()
@@ -150,6 +166,7 @@ def main():
         "url": args.url,
         "baseline": args.baseline,
         "r2": args.r2,
+        "fixed_tg": True,
         "settings": {
             "prefix_tokens": args.prefix_tokens,
             "suffix_tokens": args.suffix_tokens,
@@ -176,6 +193,7 @@ def main():
             "branch_pp": row["branch"].get("pp"),
             "cache_n": row["branch"].get("cache_n"),
             "acceptance": row["branch"].get("acceptance"),
+            "predicted_n": row["branch"].get("predicted_n"),
         }, ensure_ascii=False), flush=True)
 
     def rows(model):
@@ -196,6 +214,7 @@ def main():
             "branch_acceptance_median": acceptance,
             "self_retention": self_retention,
             "branch_cache_values": [x["branch"].get("cache_n") for x in rr],
+            "all_full_generation": all(x["fresh"].get("full_generation") and x["branch"].get("full_generation") for x in rr),
         }
 
     b = summary[args.baseline]
@@ -207,9 +226,11 @@ def main():
     cross_exact = exact_each and candidate_outputs[0] == baseline_outputs[0]
 
     gates = {
+        "fixed_generation": b["all_full_generation"] and r["all_full_generation"],
+        "acceptance_present": isinstance(b["branch_acceptance_median"], (int, float)) and isinstance(r["branch_acceptance_median"], (int, float)),
         "absolute_tg_floor": isinstance(r["branch_tg_median"], (int, float)) and r["branch_tg_median"] >= args.absolute_tg_floor,
         "self_retention": isinstance(r["self_retention"], (int, float)) and r["self_retention"] >= args.min_self_retention,
-        "vs_hc_baseline": isinstance(vs_base, (int, float)) and vs_base >= -args.max_vs_baseline_loss,
+        "vs_baseline": isinstance(vs_base, (int, float)) and vs_base >= -args.max_vs_baseline_loss,
         "cross_model_exact": cross_exact,
     }
     verdict = "PASS" if all(gates.values()) else "FAIL"
