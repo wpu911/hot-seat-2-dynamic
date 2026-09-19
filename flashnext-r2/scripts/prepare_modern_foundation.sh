@@ -33,6 +33,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 }
 [[ -z "$(git -C "$EXACT_SRC" status --porcelain)" ]] || {
   echo "ERROR: exact production snapshot must be clean/committed." >&2
+  git -C "$EXACT_SRC" status --short >&2 || true
   exit 3
 }
 [[ ! -e "$FOUNDATION" && ! -e "$RUNTIME" ]] || {
@@ -51,9 +52,6 @@ echo "new official base : $NEW_UPSTREAM"
 echo "foundation        : $FOUNDATION"
 echo "runtime           : $RUNTIME"
 
-# Ensure both official commits exist in the snapshot repository. The snapshot was
-# cloned from production's llama.cpp repo and should have upstream history; fetch
-# only when needed.
 if ! git -C "$EXACT_SRC" cat-file -e "$OLD_UPSTREAM^{commit}" 2>/dev/null; then
   git -C "$EXACT_SRC" fetch --no-tags https://github.com/ggml-org/llama.cpp.git "$OLD_UPSTREAM"
 fi
@@ -61,9 +59,6 @@ if ! git -C "$EXACT_SRC" cat-file -e "$NEW_UPSTREAM^{commit}" 2>/dev/null; then
   git -C "$EXACT_SRC" fetch --no-tags https://github.com/ggml-org/llama.cpp.git "$NEW_UPSTREAM"
 fi
 
-# Hard provenance gate: the exact production snapshot must actually descend from
-# the recorded Sep-11 official base. Otherwise OLD..EXACT would contain unrelated
-# upstream history and the overlay would be contaminated.
 if ! git -C "$EXACT_SRC" merge-base --is-ancestor "$OLD_UPSTREAM" "$EXACT_HEAD"; then
   echo "ERROR: recorded Sep-11 base is not an ancestor of exact production snapshot." >&2
   echo "Refusing to manufacture a misleading custom overlay." >&2
@@ -75,9 +70,25 @@ trap 'rm -rf "$TMP"' EXIT
 OVERLAY="$TMP/exact-production-overlay.patch"
 FILES="$TMP/overlay-files.txt"
 
-git -C "$EXACT_SRC" diff --binary "$OLD_UPSTREAM" "$EXACT_HEAD" > "$OVERLAY"
-git -C "$EXACT_SRC" diff --check "$OLD_UPSTREAM" "$EXACT_HEAD"
-git -C "$EXACT_SRC" diff --name-status "$OLD_UPSTREAM" "$EXACT_HEAD" > "$FILES"
+# Snapshot metadata is intentionally committed so the snapshot itself is clean, but
+# it is NOT production source and must never be replayed onto upstream. The previous
+# version diffed the entire snapshot commit and accidentally treated the audit patch
+# and usage note as migration inputs.
+DIFF_PATHS=(
+  .
+  ':(exclude)r2-snapshot-meta/**'
+  ':(exclude)USE_AS_PROD_SRC.txt'
+)
+
+git -C "$EXACT_SRC" diff --binary "$OLD_UPSTREAM" "$EXACT_HEAD" -- "${DIFF_PATHS[@]}" > "$OVERLAY"
+git -C "$EXACT_SRC" diff --check "$OLD_UPSTREAM" "$EXACT_HEAD" -- "${DIFF_PATHS[@]}"
+git -C "$EXACT_SRC" diff --name-status "$OLD_UPSTREAM" "$EXACT_HEAD" -- "${DIFF_PATHS[@]}" > "$FILES"
+
+if grep -Eq '(^|[[:space:]])(r2-snapshot-meta/|USE_AS_PROD_SRC\.txt$)' "$FILES"; then
+  echo "ERROR: snapshot-only metadata leaked into production overlay file list" >&2
+  cat "$FILES" >&2
+  exit 7
+fi
 
 OVERLAY_SHA="$(sha256sum "$OVERLAY" | awk '{print $1}')"
 OVERLAY_BYTES="$(wc -c < "$OVERLAY")"
@@ -86,9 +97,8 @@ OVERLAY_FILES="$(wc -l < "$FILES")"
 echo "custom overlay    : $OVERLAY_FILES files / $OVERLAY_BYTES bytes"
 echo "overlay sha256    : $OVERLAY_SHA"
 
-# Create a standalone clone because git worktree add from EXACT_HEAD cannot switch
-# to a commit that is only FETCH_HEAD unless it is present and because we want a
-# clean experimental repository with its own refs/provenance.
+# Create a standalone clone because we want a clean experimental repository with
+# its own refs/provenance.
 git clone --quiet "$EXACT_SRC" "$FOUNDATION"
 git -C "$FOUNDATION" checkout --quiet --detach "$NEW_UPSTREAM"
 mkdir -p "$FOUNDATION/r2-meta"
@@ -104,12 +114,11 @@ cp "$FILES" "$FOUNDATION/r2-meta/exact-production-overlay-files.txt"
   echo "overlay_sha256=$OVERLAY_SHA"
   echo "overlay_bytes=$OVERLAY_BYTES"
   echo "overlay_file_count=$OVERLAY_FILES"
+  echo "snapshot_metadata_excluded=1"
 } > "$FOUNDATION/r2-meta/modern-foundation-manifest.txt"
 
 cd "$FOUNDATION"
 
-# Apply OUR production delta to the new official base. 3-way is essential because
-# upstream changed qwen4exp, HC and ggml-cuda in the intervening 130 commits.
 if ! git apply --3way --whitespace=nowarn r2-meta/exact-production-overlay.patch; then
   echo >&2
   echo "ERROR: exact production overlay conflicts with Sep-18 upstream." >&2
@@ -121,8 +130,6 @@ fi
 
 git diff --check
 
-# Record the exact result as a local experiment commit. This makes Stage 10/12
-# downstream worktrees reproducible and avoids silently losing forwarded local edits.
 git add -A
 git -c user.name='FlashNext R2 Foundation' \
     -c user.email='flashnext-r2@local.invalid' \
@@ -132,8 +139,6 @@ FOUNDATION_HEAD="$(git rev-parse HEAD)"
 echo "foundation head   : $FOUNDATION_HEAD"
 echo "foundation dirty  : $(git status --porcelain | wc -l)"
 
-# Important source-level invariants from the production engine. These names are
-# intentionally broad because later fixes live in multiple files.
 for needle in \
   'Q122 V3 PREFILL_EPOCH_RESET' \
   'Q122_SPEC_DISABLE_AFTER_CACHED_LARGE_PP' \
@@ -146,7 +151,6 @@ for needle in \
   fi
 done
 
-# Confirm the modern qwen4exp HC code from post-Sep11 upstream is present.
 if ! grep -Rq 'fused_dsv4_hc_pre\|ggml_dsv4_hc_pre_gated' src ggml 2>/dev/null; then
   echo "ERROR: modern qwen4exp/HC foundation marker not found after forward-port." >&2
   exit 11
@@ -180,16 +184,12 @@ cp -a "$BUILD/bin/." "$RUNTIME/"
 sha256sum "$RUNTIME/llama-server" | tee "$FOUNDATION/r2-meta/modern-foundation-llama-server.sha256"
 "$RUNTIME/llama-server" --version | tee "$FOUNDATION/r2-meta/modern-foundation-version.txt" || true
 
-# Basic HIP backend correctness before llama-swap touches the binary.
 if [[ -x "$BUILD/bin/test-backend-ops" ]]; then
   "$BUILD/bin/test-backend-ops" test -o TOP_K -b ROCm0 \
     || "$BUILD/bin/test-backend-ops" test -o TOP_K -b HIP0 \
     || "$BUILD/bin/test-backend-ops" test -o TOP_K
 fi
 
-# Clone the exact production model args. No experimental env change is injected;
-# this A/B is only "old official foundation vs new official foundation", both with
-# the user's forwarded custom engine.
 python3 "$SCRIPT_DIR/install_llamaswap_r2_alias.py" \
   --config "$CONFIG" --source-alias "$SOURCE_ALIAS" \
   --alias "$FOUNDATION_ALIAS" --r2-bin "$RUNTIME" --jmax keep \
