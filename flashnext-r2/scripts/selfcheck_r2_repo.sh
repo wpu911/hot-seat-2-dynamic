@@ -35,8 +35,9 @@ for name in mods:
 PY
 
 printf '%s\n' '=== production-safety markers ==='
-if grep -Rns --include='*.sh' --include='*.py' 'PRODUCTION_PROMOTED=YES' "$SCRIPT_DIR"; then
-  echo 'ERROR active R2 script contains PRODUCTION_PROMOTED=YES' >&2
+if grep -Rns --include='*.sh' --include='*.py' --exclude='selfcheck_r2_repo.sh' \
+    'PRODUCTION_PROMOTED=YES' "$SCRIPT_DIR"; then
+  echo 'ERROR active R2 script contains a production-promoted YES marker' >&2
   exit 20
 fi
 
