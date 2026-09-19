@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BASELINE="${BASELINE:-qwen3.8-flash-next-r2-modern-pooled-off:256k}"
 R2="${R2:-qwen3.8-flash-next-r2-modern-pooled-on:256k}"
+RUNTIME="${RUNTIME:-/app/share/llm/Qwen3.8-Flash-Next-GGUF/runtime-text/r2-modern-qsa-pooled}"
 LOG_DIR="${LOG_DIR:-/app/share/openclaw_tools/logs}"
 mkdir -p "$LOG_DIR"
+
+bash "$SCRIPT_DIR/normalize_runtime_rpath.sh" "$RUNTIME"
+REQUIRE_BOTH_GPUS=1 bash "$SCRIPT_DIR/verify_runtime_bundle.sh" "$RUNTIME"
 
 if [[ "${FULL:-0}" == "1" ]]; then
   DEPTHS="${DEPTHS:-16384,32768,65536,114688,131072}"
@@ -27,19 +30,12 @@ echo "candidate=$R2"
 echo "depths=$DEPTHS rounds=$ROUNDS tg=$TG"
 
 python3 "$SCRIPT_DIR/bench_qsa_context_ladder.py" \
-  --baseline "$BASELINE" \
-  --r2 "$R2" \
-  --depths "$DEPTHS" \
-  --rounds "$ROUNDS" \
-  --tg "$TG" \
-  --out "$OUT" \
-  "${FORCE_ARG[@]}"
+  --baseline "$BASELINE" --r2 "$R2" --depths "$DEPTHS" \
+  --rounds "$ROUNDS" --tg "$TG" --out "$OUT" "${FORCE_ARG[@]}"
 
 set +e
 python3 "$SCRIPT_DIR/analyze_stage7_qsa.py" \
-  "$OUT" \
-  --baseline "$BASELINE" \
-  --r2 "$R2" \
+  "$OUT" --baseline "$BASELINE" --r2 "$R2" \
   --deep-from "${DEEP_FROM:-65536}" \
   --min-deep-median-gain "${MIN_GAIN:-3.0}" \
   --max-deep-loss "${MAX_DEEP_LOSS:-3.0}" \
