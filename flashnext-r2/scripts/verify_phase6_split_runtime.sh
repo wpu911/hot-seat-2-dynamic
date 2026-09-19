@@ -34,7 +34,6 @@ S_TENSOR="$(sha256sum "$TENSOR_BIN/llama-server.real" | awk '{print $1}')"
   exit 5
 }
 
-# Wrapper intent must be explicit. Do not trust alias names as evidence.
 grep -Fq -- 'extra=(--split-mode layer)' "$LAYER_BIN/llama-server" || {
   echo "ERROR layer wrapper does not force --split-mode layer" >&2; exit 6;
 }
@@ -48,11 +47,11 @@ grep -Fq -- '--fit off' "$TENSOR_BIN/llama-server" || {
   echo "ERROR tensor wrapper must force --fit off" >&2; exit 9;
 }
 
-# A wrapper's --version/--list-devices also carries split args, so verify the real
-# ELF bundle directly. Both dirs must independently resolve local libraries and
-# expose both gfx1100 and gfx1201 devices.
-REQUIRE_BOTH_GPUS=1 bash "$SCRIPT_DIR/verify_runtime_bundle.sh" "$LAYER_BIN"
-REQUIRE_BOTH_GPUS=1 bash "$SCRIPT_DIR/verify_runtime_bundle.sh" "$TENSOR_BIN"
+# ldd/readelf must inspect the ELF, not the shell wrapper.
+SERVER="$LAYER_BIN/llama-server.real" REQUIRE_BOTH_GPUS=1 \
+  bash "$SCRIPT_DIR/verify_runtime_bundle.sh" "$LAYER_BIN"
+SERVER="$TENSOR_BIN/llama-server.real" REQUIRE_BOTH_GPUS=1 \
+  bash "$SCRIPT_DIR/verify_runtime_bundle.sh" "$TENSOR_BIN"
 
 echo "PHASE6_RUNTIME_AUDIT=PASS"
 echo "REAL_BINARY_SHA256=$S_LAYER"
