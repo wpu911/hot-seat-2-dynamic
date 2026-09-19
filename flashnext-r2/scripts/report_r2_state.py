@@ -58,7 +58,6 @@ def alias_names(config: Path) -> set[str]:
     if not config.is_file():
         return set()
     names = set()
-    # llama-swap model aliases in this deployment are keys ending with :<ctx>.
     for line in config.read_text(encoding="utf-8", errors="replace").splitlines():
         m = re.match(r"^\s*([^#\s][^:]*:[^:]+):\s*(?:#.*)?$", line)
         if m:
@@ -91,7 +90,7 @@ def main():
     phase6_manifest = root / "llama.cpp-flashnext-r2-tensor-split-20260919/r2-meta/phase6-tensor-split-manifest.txt"
     ratio_manifest = root / "llama.cpp-flashnext-r2-tensor-split-20260919/r2-meta/phase6b-ratios.env"
 
-    foundation_analysis = Path("/app/share/openclaw_tools/logs/flashnext-r2-modern-foundation-ab.foundation-analysis.json")
+    foundation_analysis = logs / "flashnext-r2-modern-foundation-ab.foundation-analysis.json"
     p1 = latest(str(logs / "flashnext-r2-phase1-*/summary.env")); p1d = env_file(p1)
     p2 = latest(str(logs / "flashnext-r2-phase2-*/summary.env")); p2d = env_file(p2)
     p3 = latest(str(logs / "flashnext-r2-phase3-validation-*/summary.env")); p3d = env_file(p3)
@@ -133,7 +132,6 @@ def main():
         print("NEXT_ACTION=STOP_AND_INSPECT_PRODUCTION")
         return
 
-    # Conservative state machine: require recorded PASS evidence before advancing.
     if not foundation_manifest.is_file() or FOUNDATION not in aliases:
         nxt = "bash flashnext-r2/scripts/run_phase1_real_ab.sh"
         why = "Modern Foundation is not fully prepared/registered."
