@@ -38,7 +38,7 @@ else
 fi
 
 echo
-python3 "$SCRIPT_DIR/report_r2_state.py"
+python3 "$SCRIPT_DIR/report_r2_state_plus.py"
 
 echo
 echo "R2_RESUME_PREFLIGHT=PASS"
