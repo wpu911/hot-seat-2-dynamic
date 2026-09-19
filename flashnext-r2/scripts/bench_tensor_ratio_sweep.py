@@ -12,7 +12,9 @@ Sequence for one mirror cycle with models A..E:
 
 Each leg starts from a model-specific cold state, gets one unmeasured warm-up,
 then runs fixed-length long-context retrieval. Load/compute failure invalidates
-only that arm; unrelated llama-swap models are never globally unloaded.
+only that arm; unrelated llama-swap models are never globally unloaded. A busy
+experiment alias is different: the sweep stops instead of benchmarking through
+somebody else's request and calling the resulting soup a measurement.
 """
 from __future__ import annotations
 
@@ -39,12 +41,18 @@ def mirrored(models: list[str], cycles: int) -> list[str]:
     return pair * cycles
 
 
-def clean(models: list[str], url: str, force: bool) -> None:
+def clean(models: list[str], url: str, force: bool, *, best_effort: bool = False) -> None:
+    errors = []
     for model in models:
         try:
             unload(url, model, force)
         except Exception as e:
-            print(f"WARNING unload {model}: {e}", flush=True)
+            if best_effort:
+                print(f"WARNING cleanup unload {model}: {e}", flush=True)
+            else:
+                errors.append(f"{model}: {e}")
+    if errors:
+        raise RuntimeError("cannot establish a cold experiment state; " + " | ".join(errors))
 
 
 def main():
@@ -138,7 +146,7 @@ def main():
             leg["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             result["legs"].append(leg)
     finally:
-        clean(models, args.url, args.force)
+        clean(models, args.url, args.force, best_effort=True)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
