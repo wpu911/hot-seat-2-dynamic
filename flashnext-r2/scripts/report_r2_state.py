@@ -99,6 +99,7 @@ def main():
     p5 = latest(str(logs / "flashnext-r2-phase5-gdn-*/summary.env")); p5d = env_file(p5)
     p6 = latest(str(logs / "flashnext-r2-phase6-tensor-split-*/summary.env")); p6d = env_file(p6)
     p6b = latest(str(logs / "flashnext-r2-phase6b-ratio-*/summary.env")); p6bd = env_file(p6b)
+    poc = latest(str(logs / "flashnext-r2-final-openclaw-*/summary.env")); pocd = env_file(poc)
 
     print("=== Flash Next R2 state report ===")
     print(f"config_exists={config.is_file()}")
@@ -120,11 +121,12 @@ def main():
     show_summary("phase5", p5, p5d, ("THROUGHPUT_MODE","CACHED_GATE","ROLLBACK_GATE","PHASE5_WINNER_MODE","PHASE5_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase6", p6, p6d, ("SHORT_GATE_RC","LONG_GATE_RC","CACHED_GATE","ROLLBACK_GATE","PHASE6_WINNER_MODE","PHASE6_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase6b", p6b, p6bd, ("PHASE6B_WINNER_RATIO","PHASE6B_WINNER_ALIAS","CONFIRM_SHORT","CONFIRM_LONG","CACHED_GATE","ROLLBACK_GATE","PRODUCTION_PROMOTED","FINISHED"))
+    show_summary("openclaw", poc, pocd, ("OPENCLAW_REGRESSION","WINNER_ALIAS","PROVIDER_MODEL","RESULT","PRODUCTION_PROMOTED","FINISHED"))
 
     warnings = []
     if PROD not in aliases:
         warnings.append("production alias is missing")
-    for name, d in (("phase1",p1d),("phase2",p2d),("phase3",p3d),("phase4",p4d),("phase4b",p4bd),("phase5",p5d),("phase6",p6d),("phase6b",p6bd)):
+    for name, d in (("phase1",p1d),("phase2",p2d),("phase3",p3d),("phase4",p4d),("phase4b",p4bd),("phase5",p5d),("phase6",p6d),("phase6b",p6bd),("openclaw",pocd)):
         if d.get("PRODUCTION_PROMOTED") not in (None, "NO"):
             warnings.append(f"{name} says PRODUCTION_PROMOTED={d.get('PRODUCTION_PROMOTED')}")
     if warnings:
@@ -135,6 +137,7 @@ def main():
         return
 
     topk_decided = p1d.get("TOPK_SMOKE_RESULT") in {"PASS", "REJECT", "FAIL", "HIP_GRAPH_INTERACTION"}
+    final_winner = p6bd.get("PHASE6B_WINNER_ALIAS") or p6d.get("PHASE6_WINNER_ALIAS") or p5d.get("PHASE5_WINNER_ALIAS")
 
     if not foundation_manifest.is_file() or FOUNDATION not in aliases:
         nxt = "bash flashnext-r2/scripts/run_phase1_real_ab.sh"
@@ -175,10 +178,12 @@ def main():
     elif p6d.get("PHASE6_WINNER_MODE") == "TENSOR_1x1" and not p6bd.get("PHASE6B_WINNER_ALIAS"):
         nxt = "bash flashnext-r2/scripts/run_phase6b_verified.sh"
         why = "Ratio arms exist but verified Phase-6b sweep is incomplete."
+    elif pocd.get("OPENCLAW_REGRESSION") != "PASS" or pocd.get("WINNER_ALIAS") != final_winner:
+        nxt = "python3 flashnext-r2/scripts/run_final_openclaw_regression.py"
+        why = f"llama-swap winner {final_winner or 'UNKNOWN'} has not passed a matching real OpenClaw Gateway session regression."
     else:
-        winner = p6bd.get("PHASE6B_WINNER_ALIAS") or p6d.get("PHASE6_WINNER_ALIAS") or p5d.get("PHASE5_WINNER_ALIAS")
-        nxt = f"FINAL_OPENCLAW_REGRESSION winner={winner or 'UNKNOWN'}"
-        why = "All automated R2 experiment phases with recorded state are complete; do not promote until real OpenClaw session regression passes."
+        nxt = f"READY_FOR_PROMOTION_REVIEW winner={final_winner or 'UNKNOWN'}"
+        why = "All R2 performance/correctness gates and the matching OpenClaw Gateway regression passed. Promotion is still a separate explicit operation."
 
     print("\nDECISION")
     print(f"WHY={why}")
