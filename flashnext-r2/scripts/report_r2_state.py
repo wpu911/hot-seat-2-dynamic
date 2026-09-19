@@ -117,7 +117,7 @@ def main():
     show_summary("phase4", p4, p4d, ("MTP_THROUGHPUT_WINNER","MTP_CACHED_GATE","MTP_ACCEPTED_ALIAS","GRAPH_WINNER","PARAM_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase5", p5, p5d, ("THROUGHPUT_MODE","CACHED_GATE","ROLLBACK_GATE","PHASE5_WINNER_MODE","PHASE5_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase6", p6, p6d, ("SHORT_GATE_RC","LONG_GATE_RC","CACHED_GATE","ROLLBACK_GATE","PHASE6_WINNER_MODE","PHASE6_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
-    show_summary("phase6b", p6b, p6bd, ("RATIO_SMOKE_WINNER","FINAL_CANDIDATE_RATIO","FINAL_LONG_GAIN_PCT","PHASE6B_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
+    show_summary("phase6b", p6b, p6bd, ("PHASE6B_WINNER_RATIO","PHASE6B_WINNER_ALIAS","CONFIRM_SHORT","CONFIRM_LONG","CACHED_GATE","ROLLBACK_GATE","PRODUCTION_PROMOTED","FINISHED"))
 
     warnings = []
     if PROD not in aliases:
@@ -132,18 +132,20 @@ def main():
         print("NEXT_ACTION=STOP_AND_INSPECT_PRODUCTION")
         return
 
+    topk_decided = p1d.get("TOPK_SMOKE_RESULT") in {"PASS", "REJECT", "FAIL", "HIP_GRAPH_INTERACTION"}
+
     if not foundation_manifest.is_file() or FOUNDATION not in aliases:
         nxt = "bash flashnext-r2/scripts/run_phase1_real_ab.sh"
         why = "Modern Foundation is not fully prepared/registered."
     elif json_gate(foundation_analysis) != "PASS":
         nxt = "bash flashnext-r2/scripts/resume_phase1_after_work.sh"
         why = "Foundation exists but no current-schema PASS is recorded."
-    elif p1d.get("MTP_RESULT") != "PASS":
+    elif p1d.get("MTP_RESULT") != "PASS" or not topk_decided:
         nxt = "bash flashnext-r2/scripts/resume_phase1_after_work.sh"
-        why = "Modern MTP has not recorded PASS."
+        why = "Phase-1 MTP/TOP_K decision is incomplete."
     elif not p2d.get("FINISHED"):
         nxt = "bash flashnext-r2/scripts/run_phase2_real_ab.sh"
-        why = "Phase-1 has a valid MTP result; Phase-2 has not completed."
+        why = "Phase-1 is decided; Phase-2 has not completed."
     elif not phase3_manifest.is_file() or FINAL not in aliases:
         nxt = "bash flashnext-r2/scripts/prepare_phase3_final_candidate.sh"
         why = "Phase-2 completed; winner composition has not been prepared."
@@ -154,7 +156,7 @@ def main():
         nxt = "bash flashnext-r2/scripts/run_phase4_mtp_graph_sweep.sh"
         why = "Phase-3 passed; MTP-depth/HIP-Graph sweep is incomplete."
     elif not p5d.get("PHASE5_WINNER_ALIAS"):
-        nxt = "bash flashnext-r2/scripts/prepare_phase5_gdn_microfusion.sh && bash flashnext-r2/scripts/run_phase5_gdn_microfusion_ab.sh"
+        nxt = "bash flashnext-r2/scripts/prepare_phase5_gdn_microfusion.sh && bash flashnext-r2/scripts/run_phase5_verified.sh"
         why = "Phase-4 winner exists; GDN microfusion decision is incomplete."
     elif not phase6_manifest.is_file() or LAYER not in aliases or TENSOR not in aliases:
         nxt = "bash flashnext-r2/scripts/prepare_phase6_tensor_split.sh"
