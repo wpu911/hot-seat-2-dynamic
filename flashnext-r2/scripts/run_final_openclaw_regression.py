@@ -11,7 +11,7 @@ actually uses:
 The script does not edit OpenClaw config and does not promote production. It
 uses a unique OpenAI `user` value so two HTTP Chat Completions calls share one
 fresh OpenClaw session, verifies marker recall across the second turn, and checks
-llama-swap reports the requested experimental alias as running.
+llama-swap telemetry after each turn for the requested experimental alias.
 
 Secrets are never written to the result JSON. Authentication is resolved from
 OPENCLAW_GATEWAY_TOKEN / OPENCLAW_GATEWAY_PASSWORD first, then from literal
@@ -21,6 +21,7 @@ references of the form ${NAME} are resolved without logging their values.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import glob
 import hashlib
 import json
@@ -59,20 +60,39 @@ def read_env(path: Path | None) -> dict[str, str]:
 
 
 def resolve_winner(log_dir: Path) -> tuple[str, str]:
-    arms = [
-        ("phase6b", "flashnext-r2-phase6b-ratio-*/summary.env", "PHASE6B_WINNER_ALIAS"),
-        ("phase6", "flashnext-r2-phase6-tensor-split-*/summary.env", "PHASE6_WINNER_ALIAS"),
-        ("phase5", "flashnext-r2-phase5-gdn-*/summary.env", "PHASE5_WINNER_ALIAS"),
-    ]
-    for phase, pat, key in arms:
-        p = latest(str(log_dir / pat))
-        d = read_env(p)
-        alias = d.get(key)
-        if alias:
-            if d.get("PRODUCTION_PROMOTED") not in (None, "NO"):
-                raise RuntimeError(f"{phase} summary does not prove production remained untouched: {p}")
-            return alias, str(p)
-    raise RuntimeError("no Phase-5/6/6b winner summary found")
+    """Resolve the winner without letting an old Phase-6b outrank a newer Phase-6.
+
+    Re-running Phase-5 after Phase-6 also invalidates the latter. In that case we
+    stop rather than testing a stale descendant and producing a very official
+    looking JSON file about the wrong binary.
+    """
+    p5 = latest(str(log_dir / "flashnext-r2-phase5-gdn-*/summary.env"))
+    p6 = latest(str(log_dir / "flashnext-r2-phase6-tensor-split-*/summary.env"))
+    p6b = latest(str(log_dir / "flashnext-r2-phase6b-ratio-*/summary.env"))
+    d5, d6, d6b = read_env(p5), read_env(p6), read_env(p6b)
+
+    for phase, p, d in (("phase5", p5, d5), ("phase6", p6, d6), ("phase6b", p6b, d6b)):
+        if p and d.get("PRODUCTION_PROMOTED") not in (None, "NO"):
+            raise RuntimeError(f"{phase} summary does not prove production remained untouched: {p}")
+
+    if p6 and p5 and p6.stat().st_mtime < p5.stat().st_mtime:
+        raise RuntimeError(
+            "Phase-6 result is older than the current Phase-5 winner. Run report_r2_state.py and rebuild/retest downstream stages first."
+        )
+
+    p6_alias = d6.get("PHASE6_WINNER_ALIAS")
+    p6_mode = d6.get("PHASE6_WINNER_MODE")
+    if p6 and p6_alias:
+        if p6_mode == "TENSOR_1x1":
+            p6b_alias = d6b.get("PHASE6B_WINNER_ALIAS")
+            if p6b and p6b_alias and p6b.stat().st_mtime >= p6.stat().st_mtime:
+                return p6b_alias, str(p6b)
+        return p6_alias, str(p6)
+
+    p5_alias = d5.get("PHASE5_WINNER_ALIAS")
+    if p5 and p5_alias:
+        return p5_alias, str(p5)
+    raise RuntimeError("no current Phase-5/6/6b winner summary found")
 
 
 def expand_secret(v):
@@ -83,10 +103,19 @@ def expand_secret(v):
     return v
 
 
-def load_auth(config_path: Path) -> tuple[str, str | None]:
+def load_openclaw_config(config_path: Path) -> dict:
     if not config_path.is_file():
         raise RuntimeError(f"OpenClaw config missing: {config_path}")
-    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"OpenClaw config is not strict JSON at {config_path}: {e}. "
+            "Use OPENCLAW_GATEWAY_TOKEN/PASSWORD or export a strict JSON config for this regression; the script will not rewrite config."
+        ) from e
+
+
+def load_auth(cfg: dict) -> tuple[str, str | None]:
     auth = ((cfg.get("gateway") or {}).get("auth") or {})
     mode = str(auth.get("mode") or "token").lower()
     if mode == "none":
@@ -101,6 +130,20 @@ def load_auth(config_path: Path) -> tuple[str, str | None]:
             "set OPENCLAW_GATEWAY_TOKEN or OPENCLAW_GATEWAY_PASSWORD for this regression run"
         )
     return mode, value
+
+
+def check_model_policy(cfg: dict, provider_model: str) -> None:
+    policy = (((cfg.get("agents") or {}).get("defaults") or {}).get("modelPolicy") or {})
+    allow = policy.get("allow")
+    if not isinstance(allow, list) or not allow:
+        return
+    patterns = [x for x in allow if isinstance(x, str) and x]
+    if any(fnmatch.fnmatchcase(provider_model, p) for p in patterns):
+        return
+    raise RuntimeError(
+        f"OpenClaw modelPolicy.allow does not permit {provider_model}. "
+        "Regression will not mutate the allowlist; add the exact ref or local-llm/* deliberately before retrying."
+    )
 
 
 def http_json(method: str, url: str, obj=None, *, token=None, headers=None, timeout=7200):
@@ -154,16 +197,18 @@ def llama_swap_has_model(models_obj, alias: str) -> bool:
     return any(isinstance(x, dict) and x.get("id") == alias for x in data)
 
 
-def running_contains(obj, alias: str) -> bool:
-    try:
-        return alias in json.dumps(obj, ensure_ascii=False)
-    except Exception:
-        return False
+def telemetry_contains(swap: str, alias: str) -> tuple[bool, dict]:
+    snap = {}
+    for name, path in (("running", "/running"), ("performance", "/api/performance")):
+        try:
+            snap[name] = http_json("GET", swap + path, timeout=30)
+        except Exception as e:
+            snap[name] = {"unavailable": str(e)}
+    blob = json.dumps(snap, ensure_ascii=False)
+    return alias in blob, snap
 
 
 def unique_stress(marker: str, blocks: int) -> str:
-    # High-diversity text avoids the repeated-token PLE benchmark trap. Keep it
-    # deterministic enough to audit while giving each paragraph distinct data.
     rows = []
     for i in range(blocks):
         a = (i * 104729 + 17) % 1000003
@@ -210,15 +255,15 @@ def main():
     if not llama_swap_has_model(swap_models, winner):
         raise SystemExit(f"ERROR llama-swap /v1/models does not advertise winner: {winner}")
 
-    auth_mode, credential = load_auth(Path(args.openclaw_config))
+    cfg = load_openclaw_config(Path(args.openclaw_config))
+    auth_mode, credential = load_auth(cfg)
+    provider_model = f"{args.provider}/{winner}"
+    check_model_policy(cfg, provider_model)
+
     gateway_models = http_json("GET", args.gateway + "/v1/models", token=credential, timeout=30)
-    # The Gateway endpoint is agent-first. We only require that the endpoint is
-    # enabled and answers; backend selection is verified via x-openclaw-model and
-    # llama-swap /running below.
     if not isinstance(gateway_models, dict):
         raise SystemExit("ERROR OpenClaw /v1/models returned a non-JSON object")
 
-    provider_model = f"{args.provider}/{winner}"
     marker = "R2OC_" + secrets.token_hex(8).upper()
     user_key = "flashnext-r2-regression-" + secrets.token_hex(8)
     agent_model = f"openclaw/{args.agent}"
@@ -236,8 +281,7 @@ def main():
     t1 = time.time() - t0
     text1 = response_text(r1)
     marker_first = marker in text1
-    running1 = http_json("GET", args.swap + "/running", timeout=30)
-    routed1 = running_contains(running1, winner)
+    routed1, telem1 = telemetry_contains(args.swap, winner)
 
     req2 = {
         "model": agent_model,
@@ -250,12 +294,8 @@ def main():
     t2 = time.time() - t0
     text2 = response_text(r2)
     marker_recall = marker in text2
-    running2 = http_json("GET", args.swap + "/running", timeout=30)
-    routed2 = running_contains(running2, winner)
+    routed2, telem2 = telemetry_contains(args.swap, winner)
 
-    # One stateless tool-shaped request verifies the normal agent path still
-    # handles structured output under the same backend override without relying
-    # on the previous session.
     user_key2 = "flashnext-r2-structured-" + secrets.token_hex(8)
     req3 = {
         "model": agent_model,
@@ -271,8 +311,7 @@ def main():
     t3 = time.time() - t0
     text3 = response_text(r3)
     structured_ok = '"status"' in text3 and '"ok"' in text3 and '40' in text3
-    running3 = http_json("GET", args.swap + "/running", timeout=30)
-    routed3 = running_contains(running3, winner)
+    routed3, telem3 = telemetry_contains(args.swap, winner)
 
     checks = {
         "gateway_models_ok": True,
@@ -280,15 +319,15 @@ def main():
         "first_turn_marker": marker_first,
         "same_session_marker_recall": marker_recall,
         "structured_output": structured_ok,
-        "winner_seen_running_after_turn1": routed1,
-        "winner_seen_running_after_turn2": routed2,
-        "winner_seen_running_after_turn3": routed3,
+        "winner_seen_in_swap_telemetry_after_turn1": routed1,
+        "winner_seen_in_swap_telemetry_after_turn2": routed2,
+        "winner_seen_in_swap_telemetry_after_turn3": routed3,
     }
     verdict = "PASS" if all(checks.values()) else "FAIL"
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = Path(args.out or (log_dir / f"flashnext-r2-final-openclaw-{stamp}.json"))
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "winner_alias": winner,
         "winner_source": winner_source,
@@ -304,6 +343,11 @@ def main():
         "response3_sha256": hashlib.sha256(text3.encode("utf-8")).hexdigest(),
         "latency_s": {"turn1": t1, "turn2": t2, "structured": t3},
         "response_lengths": {"turn1": len(text1), "turn2": len(text2), "structured": len(text3)},
+        "telemetry_hashes": {
+            "turn1": hashlib.sha256(json.dumps(telem1, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+            "turn2": hashlib.sha256(json.dumps(telem2, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+            "turn3": hashlib.sha256(json.dumps(telem3, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+        },
         "checks": checks,
         "verdict": verdict,
         "production_promoted": False,
@@ -318,6 +362,7 @@ def main():
         "\n".join([
             f"OPENCLAW_REGRESSION={verdict}",
             f"WINNER_ALIAS={winner}",
+            f"WINNER_SOURCE={winner_source}",
             f"PROVIDER_MODEL={provider_model}",
             f"RESULT={out}",
             "PRODUCTION_PROMOTED=NO",
