@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stage 14 end-to-end A/B through the real llama-swap :8090 path.
-#
-# Important Qwen4Exp detail: the long-context QSA selector is roughly k~2048
-# (often 2051 after local-cell accounting) over multiple query rows. In PR #28313
-# that does NOT use the flashy small-k path; it falls through to the parallel
-# radix path. Therefore do a cheap 32K/64K smoke A/B first instead of spending
-# the evening prefilling 128K four times for a kernel that may be neutral here.
-#
-# Default smoke:
-#   32K,64K / OFF-ON once for graph ON and graph OFF
-# Full confirmation after a promising smoke:
-#   FULL=1 bash run_stage14_rocm_topk_ab.sh
-# which uses 16K,32K,64K,128K and 4 alternating legs.
+# Stage 14 end-to-end A/B through llama-swap :8090.
+# Qwen4Exp QSA k~2048 multi-row is expected to exercise parallel radix, so a
+# cheap 32K/64K smoke is mandatory before the full 128K confirmation.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BASE_ON="${BASE_ON:-qwen3.8-flash-next-r2-modern-mtp:256k}"
 R2_ON="${R2_ON:-qwen3.8-flash-next-r2-rocm-topk:256k}"
 BASE_OFF="${BASE_OFF:-qwen3.8-flash-next-r2-topk-base-nograph:256k}"
 R2_OFF="${R2_OFF:-qwen3.8-flash-next-r2-topk-nograph:256k}"
+BASE_RUNTIME="${BASE_RUNTIME:-/app/share/llm/Qwen3.8-Flash-Next-GGUF/runtime-text/r2-modern-mtp}"
+R2_RUNTIME="${R2_RUNTIME:-/app/share/llm/Qwen3.8-Flash-Next-GGUF/runtime-text/r2-rocm-topk}"
 LOG_DIR="${LOG_DIR:-/app/share/openclaw_tools/logs}"
+
+# Keep both experiment bundles independent of their CMake build trees. Graph-OFF
+# aliases use the same binaries, so auditing these two runtimes covers all arms.
+for rt in "$BASE_RUNTIME" "$R2_RUNTIME"; do
+  bash "$SCRIPT_DIR/normalize_runtime_rpath.sh" "$rt"
+  REQUIRE_BOTH_GPUS=1 bash "$SCRIPT_DIR/verify_runtime_bundle.sh" "$rt"
+done
 
 if [[ "${FULL:-0}" == "1" ]]; then
   DEPTHS="${DEPTHS:-16384,32768,65536,131072}"
@@ -47,42 +46,28 @@ echo "NOTE: qwen4exp QSA k~2048 multi-row is expected to exercise parallel radix
 echo
 echo "=== pass 1: HIP graphs ON ==="
 python3 "$SCRIPT_DIR/bench_qsa_context_ladder.py" \
-  --baseline "$BASE_ON" \
-  --r2 "$R2_ON" \
-  --depths "$DEPTHS" \
-  --tg "$TG" \
-  --rounds "$ROUNDS" \
-  --out "$ON_OUT" \
-  "${FORCE_ARG[@]}"
+  --baseline "$BASE_ON" --r2 "$R2_ON" --depths "$DEPTHS" \
+  --tg "$TG" --rounds "$ROUNDS" --out "$ON_OUT" "${FORCE_ARG[@]}"
 
 echo
 echo "=== pass 2: HIP graphs OFF ==="
 python3 "$SCRIPT_DIR/bench_qsa_context_ladder.py" \
-  --baseline "$BASE_OFF" \
-  --r2 "$R2_OFF" \
-  --depths "$DEPTHS" \
-  --tg "$TG" \
-  --rounds "$ROUNDS" \
-  --out "$OFF_OUT" \
-  "${FORCE_ARG[@]}"
+  --baseline "$BASE_OFF" --r2 "$R2_OFF" --depths "$DEPTHS" \
+  --tg "$TG" --rounds "$ROUNDS" --out "$OFF_OUT" "${FORCE_ARG[@]}"
 
 echo
 echo "=== Stage 14 analysis ==="
 set +e
 python3 "$SCRIPT_DIR/analyze_stage14_rocm_topk.py" \
-  --on "$ON_OUT" \
-  --off "$OFF_OUT" \
-  --base-on "$BASE_ON" \
-  --r2-on "$R2_ON" \
-  --base-off "$BASE_OFF" \
-  --r2-off "$R2_OFF" \
+  --on "$ON_OUT" --off "$OFF_OUT" \
+  --base-on "$BASE_ON" --r2-on "$R2_ON" \
+  --base-off "$BASE_OFF" --r2-off "$R2_OFF" \
   --deep-from "${DEEP_FROM:-32768}" \
   --min-on-gain "${MIN_ON_GAIN:-2.0}" \
   --min-off-gain-for-interaction "${MIN_OFF_GAIN:-3.0}" \
   --max-deep-loss "${MAX_DEEP_LOSS:-2.0}" \
   --max-acceptance-drop-pp "${MAX_ACC_DROP_PP:-3.0}" \
-  --max-pp-loss "${MAX_PP_LOSS:-5.0}" \
-  --out "$ANALYSIS_OUT"
+  --max-pp-loss "${MAX_PP_LOSS:-5.0}" --out "$ANALYSIS_OUT"
 RC=$?
 set -e
 
