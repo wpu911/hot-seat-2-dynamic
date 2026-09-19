@@ -106,13 +106,15 @@ head 53b1389d0bf98fa367e2a0ce0475008e762ebf28
 12 commits / 19 files
 ```
 
-TOP_K 只在真实 graphs-ON 路径有收益时保留。smoke PASS 后才跑：
+截至 2026-09-19，#28243 仍为 open，因此继续固定 pin，不跟着远端分支漂移。
+
+TOP_K smoke 后才决定是否跑 full：
 
 ```bash
 TOPK_FULL=1 bash flashnext-r2/scripts/run_phase1_real_ab.sh
 ```
 
-确认 16K / 32K / 64K / 128K。
+确认 16K / 32K / 64K / 128K。TOP_K 的 Graph ON/OFF 交互必须保留记录，因为 ROCm graph exec-update 上游修复目前仍未落地，不能把 Graph ON 当作天然优选。
 
 ---
 
@@ -185,6 +187,15 @@ source  /app/share/llama_box/src/llama.cpp-flashnext-r2-final-pre-sweep-20260919
 alias   qwen3.8-flash-next-r2-final-pre-sweep:256k
 ```
 
+正式 benchmark 前先做 runtime isolation：
+
+```text
+build-tree RUNPATH → $ORIGIN
+ldd 无缺失
+不得解析到临时 build-r2-* 目录
+gfx1100 + gfx1201 均可见
+```
+
 最终验证固定四关：
 
 ```text
@@ -198,20 +209,40 @@ Gate 0 会再次运行 native rollback audit，防止中间 semantic merge 把 #
 
 ---
 
-## 5. Phase 4：只扫仍然有意义的参数
+## 5. Phase 4：MTP depth + HIP Graph
 
 ```bash
 bash flashnext-r2/scripts/run_phase4_mtp_graph_sweep.sh
 ```
 
-现在只扫：
+现在扫描：
 
 ```text
-MTP n-max 2 / 3 / 4
+MTP n-max 1 / 2 / 3 / 4
 HIP Graph ON / OFF
 ```
 
-每个 MTP winner 必须重新过 cached Large-PP。
+为什么补 n-max=1：较新的 qwen4exp MTP 外部测试显示，一些 interconnect-bound 多卡机器上 1-deep draft 反而最好；另一批机器则 3/4 更好。这个结果不能外推到本机，所以 gfx1100 + gfx1201 直接四档一起测。
+
+MTP sweep 不再做三组 pairwise A/B，而是同 runtime 四 alias 镜像顺序：
+
+```text
+1 → 2 → 3 → 4 → 4 → 3 → 2 → 1
+```
+
+硬要求：
+
+```text
+fixed TG512
+每个 sample 有 draft_n / draft_n_accepted
+每个 arm warm-up 后才计时
+输出重新 tokenize
+默认前 128 generated tokens 与 n-max=2 anchor 一致
+坏 arm 单独淘汰
+非 anchor 至少 +1% median TG 才改 winner
+```
+
+MTP winner 还必须重新过 cached Large-PP，然后才进入 HIP Graph ON/OFF。
 
 ### 已退休的旧参数
 
@@ -226,7 +257,41 @@ HIP Graph ON / OFF
 
 ---
 
-## 6. Phase 5：仅剩的 GDN microfusion
+## 6. Phase 4b：参数 winner 深水区复验
+
+Phase 4 的 winner 不能直接喂给源码级 GDN 实验。先运行：
+
+```bash
+bash flashnext-r2/scripts/run_phase4b_param_validation.sh
+```
+
+固定三关：
+
+```text
+32K / 64K / 128K retrieval + TG
+16K cached Large-PP / high-LCP
+64K recurrent rollback + MTP
+```
+
+如果 Phase-4 参数 winner 任一关失败，则**自动回退实验基线**到已经通过 Phase-3 的：
+
+```text
+qwen3.8-flash-next-r2-final-pre-sweep:256k
+```
+
+记录：
+
+```text
+PARAM_ACCEPTED=NO
+PHASE4B_WINNER_ALIAS=<safe fallback>
+VALIDATION=PASS
+```
+
+这里 `VALIDATION=PASS` 表示已经得到安全可继续的 winner/fallback，不表示被拒绝的参数 arm 通过。要判断参数 arm 自己，读 `PARAM_ACCEPTED`。
+
+---
+
+## 7. Phase 5：仅剩的 GDN microfusion
 
 现代 upstream 已经有 qwen4exp HC fused ops 和 fused GDN，所以不再整包移植 JohnTDI stack。
 
@@ -238,12 +303,14 @@ E7b  q/k L2 norm 收进 GDN kernel
 E7b2 FMA accumulation selector
 ```
 
+入口改为：
+
 ```bash
-bash flashnext-r2/scripts/prepare_phase5_gdn_microfusion.sh
-bash flashnext-r2/scripts/run_phase5_gdn_microfusion_ab.sh
+bash flashnext-r2/scripts/prepare_phase5_from_phase4b.sh
+bash flashnext-r2/scripts/run_phase5_verified.sh
 ```
 
-三个相同 binary alias：
+`prepare_phase5_from_phase4b.sh` 只接受 Phase-4b 已确认的 winner/fallback。verified runner 会先归一实验 runtime RUNPATH、检查共享库和双卡，再做三个相同 binary alias：
 
 ```text
 GDN OFF
@@ -255,25 +322,25 @@ PROLOG + L2
 
 ---
 
-## 7. Phase 6：qwen4exp 双卡 Tensor Split #28569
+## 8. Phase 6：qwen4exp 双卡 Tensor Split #28569
 
-当前异构双卡为 gfx1100 + gfx1201。此前 layer split 的 Flash Next 双卡吞吐没有恢复到历史单卡 18–19 t/s，因此现在把 upstream #28569 作为**独立实验变量**，不再直接排除。
+当前异构双卡为 gfx1100 + gfx1201。此前 layer split 的 Flash Next 双卡吞吐没有恢复到历史单卡 18–19 t/s，因此把 upstream #28569 作为**独立实验变量**。
 
-#28569 只做两件关键事：
+截至 2026-09-19，#28569 仍为 open，固定测试其当前 head，不把“有 PR”误写成“已经进 upstream”。它的核心变化是：
 
 ```text
 允许 LLM_ARCH_QWEN4EXP 使用 --split-mode tensor
 qwen4exp hc_init 后强制 ggml_build_forward_expand(gf, res_hc)
 ```
 
-第一轮严格使用 upstream ROCm 用户已经实际跑过的 1,1：
+第一轮严格 1,1：
 
 ```bash
 bash flashnext-r2/scripts/prepare_phase6_tensor_split.sh
-bash flashnext-r2/scripts/run_phase6_tensor_split_ab.sh
+bash flashnext-r2/scripts/run_phase6_verified.sh
 ```
 
-同一个真实 ELF，仅 wrapper 区分：
+verified 入口会先归一 layer/tensor runtime 的 RUNPATH，再确认同一个真实 ELF，仅 wrapper 区分：
 
 ```text
 LAYER
@@ -285,7 +352,7 @@ TENSOR 1,1
   --fit off
 ```
 
-这里 `--fit off` 是硬要求。llama.cpp 当前明确没有为 SPLIT_MODE_TENSOR 实现 auto-fit。让一个“不支持”的自动功能替你管理两张不同容量显卡，属于典型的人类乐观主义。
+这里 `--fit off` 是硬要求。llama.cpp 当前没有为 SPLIT_MODE_TENSOR 实现 auto-fit。让一个“不支持”的自动功能替你管理两张不同容量显卡，属于典型的人类乐观主义。
 
 Phase 6 四关：
 
@@ -298,13 +365,13 @@ Phase 6 四关：
 
 只有 tensor 1,1 在深上下文 median TG 至少 +2% 且其余 gate 全过，才进入 Phase 6b。
 
-### 7.1 Phase 6b：异构显存比例自动 sweep
+### 8.1 Phase 6b：异构显存比例自动 sweep
 
 因为 7900 XTX 与 R9700 容量不同，1,1 不是最终结论。Phase 6b 读取**候选 binary 自己的 `--list-devices` 输出**以及 alias 的实际 `--device` 顺序，不猜 ROCm0/ROCm1 谁是谁。
 
 ```bash
 bash flashnext-r2/scripts/prepare_phase6b_tensor_ratio_sweep.sh
-bash flashnext-r2/scripts/run_phase6b_tensor_ratio_sweep.sh
+bash flashnext-r2/scripts/run_phase6b_verified.sh
 ```
 
 对两张卡自动生成：
@@ -315,7 +382,7 @@ MID   等分与容量比例之间的中间比例
 CAP   按总 VRAM 容量比例
 ```
 
-若设备顺序是 24 GiB → 32 GiB，典型会近似：
+若设备顺序是 24 GiB → 32 GiB，典型近似：
 
 ```text
 EVEN  1,1
@@ -323,9 +390,9 @@ MID   13,15 左右
 CAP   3,4 左右
 ```
 
-若设备顺序反过来，比例自动反过来。这里使用**总 VRAM**而不是当时 free VRAM，因为 free VRAM 可能正被其他已加载模型污染。
+若设备顺序反过来，比例自动反过来。使用**总 VRAM**而不是当时 free VRAM，因为 free VRAM 可能被其他已加载模型污染。
 
-Phase 6b 先只跑 MID/CAP 的 32K/64K smoke，选出较好的正收益候选，再做：
+Phase 6b 先跑 MID/CAP 的 32K/64K smoke，选出正收益候选，再做：
 
 ```text
 short exact A/B
@@ -334,11 +401,11 @@ cached Large-PP
 64K rollback
 ```
 
-最终 ratio 若连 +1% 的重复长上下文 median TG 都站不住，就保留 1,1，不为一个统计噪声多养两套配置。
+最终 ratio 若连 +1% 的重复长上下文 median TG 都站不住，就保留 1,1，不为统计噪声多养一套配置。
 
 ---
 
-## 8. Modern Foundation 已经有，不再重复搬的东西
+## 9. Modern Foundation 已经有，不再重复搬的东西
 
 ```text
 qwen4exp native recurrent rollback #28123
@@ -374,11 +441,24 @@ wave64 强开
   不拿兼容性换 benchmark 截图。
 ```
 
-`-sm tensor #28569` 已从“暂不走”移入 Phase 6，但仍是实验路线，绝不在 A/B 之前直接改生产。
+`-sm tensor #28569` 已移入 Phase 6，但仍是实验路线，绝不在 A/B 之前直接改生产。
 
 ---
 
-## 9. 最终生产切换条件
+## 10. 中断恢复
+
+每次 Work/会话重新接手，只运行：
+
+```bash
+git pull
+python3 flashnext-r2/scripts/report_r2_state.py
+```
+
+只认它输出的 `NEXT_ACTION`。当前状态机已经包含 Phase-4b，不会再出现“Phase-4 选了个短跑冠军，直接拿去叠下一层补丁”的跳关。
+
+---
+
+## 11. 最终生产切换条件
 
 只有最终候选同时满足：
 
