@@ -147,10 +147,10 @@ if [[ -x "$BUILD/bin/test-backend-ops" ]]; then
     || "$BUILD/bin/test-backend-ops" test -o TOP_K
 fi
 
-mkdir -p "$RUNTIME"
-cp -a "$BUILD/bin/." "$RUNTIME/"
+REQUIRE_BOTH_GPUS="${REQUIRE_BOTH_GPUS:-1}" \
+  bash "$SCRIPT_DIR/stage_runtime_bundle.sh" \
+    "$BUILD/bin" "$RUNTIME" "$R2_SRC/r2-meta/runtime-bundle"
 sha256sum "$RUNTIME/llama-server" | tee r2-meta/stage7-modern-qsa-llama-server.sha256
-"$RUNTIME/llama-server" --version | tee r2-meta/stage7-modern-qsa-version.txt || true
 
 # Same candidate binary on both aliases. Only QWEN4EXP_QSA_GATHER changes.
 python3 "$SCRIPT_DIR/install_llamaswap_r2_alias.py" \
