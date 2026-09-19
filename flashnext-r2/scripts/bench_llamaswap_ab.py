@@ -13,6 +13,10 @@ an unrelated Ornith/Vision/etc process is not killed by the benchmark.
 TG legs use ignore_eos=true and reject short generations. Current llama-server
 reports speculative counters inside timings as draft_n / draft_n_accepted; older
 aliases are still accepted as fallbacks for compatibility.
+
+Each leg performs one unmeasured warm-up request after model load. This keeps
+first-use HIP graph capture / kernel initialization out of the measured PP/TG
+samples. The warm-up is recorded in JSON for audit but never included in medians.
 """
 from __future__ import annotations
 
@@ -27,6 +31,7 @@ import urllib.request
 BASE = "qwen3.8-flash-next:256k"
 R2 = "qwen3.8-flash-next-r2:256k"
 URL = "http://127.0.0.1:8090"
+SCHEMA_VERSION = 3
 
 
 def http_json(method: str, url: str, obj=None, timeout=1800):
@@ -183,14 +188,40 @@ def one_completion(base_url: str, model: str, prompt: str, n_predict: int, *, fi
     }
 
 
-def run_leg(base_url: str, model: str, pp_tokens: list[int], tg_predict: int, repeats: int):
+def warmup_leg(base_url: str, model: str, pp_tokens: int, tg_predict: int):
+    prompt = exact_prompt(base_url, model, pp_tokens)
+    row = one_completion(base_url, model, prompt, tg_predict, fixed_length=True)
+    if not row["full_generation"]:
+        raise RuntimeError(
+            f"{model}: warm-up requested {tg_predict} tokens but server reported "
+            f"predicted_n={row['predicted_n']}"
+        )
+    return row
+
+
+def run_leg(base_url: str, model: str, pp_tokens: list[int], tg_predict: int, repeats: int,
+            warmup_pp: int, warmup_tg: int):
     result = {
         "model": model,
         "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "running_before": get_optional(base_url, "/running"),
+        "warmup": None,
         "pp": {},
         "tg": [],
     }
+
+    print(f"warmup pp={warmup_pp} tg={warmup_tg}", flush=True)
+    result["warmup"] = warmup_leg(base_url, model, warmup_pp, warmup_tg)
+    print(json.dumps({
+        "warmup_pp": result["warmup"].get("pp"),
+        "warmup_tg": result["warmup"].get("tg"),
+        "warmup_acceptance": (
+            result["warmup"].get("accepted") / result["warmup"].get("drafted")
+            if isinstance(result["warmup"].get("drafted"), (int, float)) and result["warmup"].get("drafted") > 0
+            and isinstance(result["warmup"].get("accepted"), (int, float))
+            else None
+        ),
+    }, ensure_ascii=False), flush=True)
 
     for n in pp_tokens:
         prompt = exact_prompt(base_url, model, n)
@@ -253,6 +284,8 @@ def main():
     ap.add_argument("--repeat", type=int, default=3)
     ap.add_argument("--tg", type=int, default=256)
     ap.add_argument("--pp", default="512,2048,8192")
+    ap.add_argument("--warmup-pp", type=int, default=256)
+    ap.add_argument("--warmup-tg", type=int, default=64)
     ap.add_argument("--force", action="store_true", help="allow takeover even if a Flash Next slot appears busy")
     ap.add_argument("--out", default="/app/share/openclaw_tools/logs/flashnext-r2-ab.json")
     args = ap.parse_args()
@@ -260,11 +293,13 @@ def main():
     pp_tokens = [int(x) for x in args.pp.split(",") if x.strip()]
     sequence = [args.baseline if i % 2 == 0 else args.r2 for i in range(args.rounds)]
     all_results = {
+        "schema_version": SCHEMA_VERSION,
         "url": args.url,
         "sequence": sequence,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "fixed_tg": True,
         "requested_tg": args.tg,
+        "warmup": {"pp": args.warmup_pp, "tg": args.warmup_tg},
         "legs": [],
     }
 
@@ -277,7 +312,10 @@ def main():
         unload_model(args.url, model, args.force)
         time.sleep(2)
 
-        leg = run_leg(args.url, model, pp_tokens, args.tg, args.repeat)
+        leg = run_leg(
+            args.url, model, pp_tokens, args.tg, args.repeat,
+            args.warmup_pp, args.warmup_tg,
+        )
         all_results["legs"].append(leg)
         print(json.dumps(summarize(leg), ensure_ascii=False, indent=2), flush=True)
         previous = model
