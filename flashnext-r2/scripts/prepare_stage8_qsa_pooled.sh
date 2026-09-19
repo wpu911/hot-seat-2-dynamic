@@ -144,10 +144,10 @@ if [[ -x "$BUILD/bin/test-backend-ops" ]]; then
     || "$BUILD/bin/test-backend-ops" test -o TOP_K
 fi
 
-mkdir -p "$RUNTIME"
-cp -a "$BUILD/bin/." "$RUNTIME/"
+REQUIRE_BOTH_GPUS="${REQUIRE_BOTH_GPUS:-1}" \
+  bash "$SCRIPT_DIR/stage_runtime_bundle.sh" \
+    "$BUILD/bin" "$RUNTIME" "$R2_SRC/r2-meta/runtime-bundle"
 sha256sum "$RUNTIME/llama-server" | tee r2-meta/stage8-modern-pooled-llama-server.sha256
-"$RUNTIME/llama-server" --version | tee r2-meta/stage8-modern-pooled-version.txt || true
 
 # Same candidate binary in both arms. QSA gather stays ON in both. Only the
 # pooled-cache presence-based kill switch differs.
