@@ -25,6 +25,8 @@ mods = [
     'bench_llamaswap_ab',
     'bench_mtp_depth_sweep',
     'analyze_mtp_sweep',
+    'bench_tensor_ratio_sweep',
+    'analyze_tensor_ratio_sweep',
     'run_final_openclaw_regression',
     'prepare_promotion_review',
     'report_r2_state',
@@ -49,6 +51,7 @@ p = Path(sys.argv[1])
 checks = {
     'bench_llamaswap_ab.py': '127.0.0.1:8090',
     'bench_qsa_context_ladder.py': '127.0.0.1:8090',
+    'bench_tensor_ratio_sweep.py': '127.0.0.1:8090',
     'bench_stage10_cached_largepp.py': '127.0.0.1:8090',
     'bench_stage8_rollback_stress.py': '127.0.0.1:8090',
     'run_final_openclaw_regression.py': '127.0.0.1:18789',
