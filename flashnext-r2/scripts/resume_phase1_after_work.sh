@@ -41,23 +41,23 @@ curl -fsS --max-time 20 http://127.0.0.1:8090/v1/models >/dev/null || {
   exit 6
 }
 
+# Old Work runs may have staged build/bin before the runtime isolation hardening.
+# Repair only this EXPERIMENT runtime: rewrite build-tree RUNPATH entries to
+# $ORIGIN, preserving system/ROCm entries. Production is never touched.
+OUT="$LOG_DIR/flashnext-r2-foundation-rpath-normalize.log" \
+  bash "$SCRIPT_DIR/normalize_runtime_rpath.sh" "$FOUNDATION_RUNTIME"
+
 # Runtime packaging is part of correctness. A binary that quietly resolves local
-# libllama/libggml from the disposable CMake build tree is not a real independent
+# libllama/libggml from the disposable CMake build tree is not an independent
 # experiment runtime and may die after cleanup.
 REQUIRE_BOTH_GPUS="${REQUIRE_BOTH_GPUS:-1}" \
   OUT="$LOG_DIR/flashnext-r2-foundation-runtime-verify.log" \
   bash "$SCRIPT_DIR/verify_runtime_bundle.sh" "$FOUNDATION_RUNTIME"
 
-# Re-run the two source/runtime gates before trusting an experiment prepared by an
-# interrupted session. This is cheap compared with loading the 190+ GiB model.
 bash "$SCRIPT_DIR/verify_modern_foundation_carryover.sh"
 env SRC="$FOUNDATION_SRC" CONFIG="$CONFIG" ALIAS="$FOUNDATION_ALIAS" \
   bash "$SCRIPT_DIR/verify_qwen4exp_native_rs_rollback.sh"
 
-# Never trust a stale analysis file on its own. Work may have produced it with an
-# older benchmark that allowed early EOS or failed to read timings.draft_n. Re-run
-# the CURRENT analyzer over the raw JSON. Legacy raw results intentionally fail the
-# fixed_tg schema gate and trigger one fresh A/B instead of being silently reused.
 revalidate_existing_result() {
   [[ -f "$FOUNDATION_RESULT" ]] || return 1
   echo "FOUNDATION_AB_REVALIDATE=$FOUNDATION_RESULT"
@@ -91,10 +91,6 @@ else
   }
 fi
 
-# Foundation is now known-good. Continue only the uncompleted Phase-1 stages.
-# START_AT=mtp deliberately avoids rebuilding the snapshot/foundation that Work
-# already prepared. The phase runner still performs preflight, config backup and
-# rollback audit before touching the MTP candidate.
 START_AT=mtp STOP_AFTER=topk TOPK_FULL="${TOPK_FULL:-0}" \
   bash "$SCRIPT_DIR/run_phase1_real_ab.sh"
 
