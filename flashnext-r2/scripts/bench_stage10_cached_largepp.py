@@ -1,22 +1,10 @@
 #!/usr/bin/env python3
-"""Stage-10 cached Large-PP / rollback regression test.
+"""Cached Large-PP / high-LCP MTP regression gate.
 
-The normal Stage-10 A/B deliberately uses cache_prompt=False to isolate steady
-MTP throughput. That does NOT exercise the production failure mode seen on
-2026-09-11, where a cached high-LCP request crossed a Large-PP ownership boundary
-and speculative multi-row verification collapsed to ~0.1 tok/s.
-
-This test compares the modern foundation baseline with the modern-MTP candidate.
-For each model it:
-  1. unloads the alias;
-  2. fills a long prompt with cache_prompt=true;
-  3. sends a high-LCP branched prompt (same prefix + new suffix), forcing cache
-     reuse / rollback rather than a clean fresh decode;
-  4. records PP, TG, wall time, cache counters when exposed, and MTP acceptance.
-
-TG is fixed-length with ignore_eos=true. Current llama-server speculative counters
-are read from timings.draft_n / timings.draft_n_accepted, with legacy fallbacks.
-It never unloads unrelated models and never modifies llama-swap configuration.
+This targets the historical failure mode where fresh decode looked normal but a
+cached high-LCP branch crossed the Large-PP ownership boundary and speculative
+multi-row verification collapsed. TG is fixed-length; current llama-server MTP
+counters are read from timings.draft_n / timings.draft_n_accepted.
 """
 from __future__ import annotations
 
@@ -60,8 +48,6 @@ def completion(base_url: str, model: str, prompt: str, n_predict: int):
         raise RuntimeError(f"unexpected completion response: {type(r)}")
     timings = r.get("timings", {}) or {}
     drafted, accepted = speculative_counts(r, timings)
-    # Cache counters have moved across server revisions. Prefer timings if present,
-    # then fall back to the top-level compatibility names.
     cache_n = pick(timings, ("tokens_cached", "n_cached", "cache_n", "prompt_cached_n"))
     if cache_n is None:
         cache_n = pick(r, ("tokens_cached", "n_cached", "cache_n", "prompt_cached_n"))
@@ -72,6 +58,7 @@ def completion(base_url: str, model: str, prompt: str, n_predict: int):
             f"{model}: cached TG requested {n_predict} tokens but server reported predicted_n={predicted_n}; "
             "refusing to trust a short early-EOS timing"
         )
+    mtp_valid = isinstance(drafted, (int, float)) and drafted > 0 and isinstance(accepted, (int, float))
     return {
         "wall_s": wall,
         "prompt_n": timings.get("prompt_n"),
@@ -80,7 +67,8 @@ def completion(base_url: str, model: str, prompt: str, n_predict: int):
         "tg": timings.get("predicted_per_second"),
         "drafted": drafted,
         "accepted": accepted,
-        "acceptance": (accepted / drafted) if isinstance(drafted, (int, float)) and drafted > 0 and isinstance(accepted, (int, float)) else None,
+        "acceptance": (accepted / drafted) if mtp_valid else None,
+        "mtp_valid": mtp_valid,
         "cache_n": cache_n,
         "full_generation": full_generation,
         "content": r.get("content", ""),
@@ -106,19 +94,11 @@ def suffix_text(base_url: str, model: str, target_tokens: int) -> str:
 def run_model(base_url: str, model: str, prefix_tokens: int, suffix_tokens: int, n_predict: int, force: bool):
     unload_model(base_url, model, force)
     time.sleep(2)
-
     prefix = exact_prompt(base_url, model, prefix_tokens)
     suffix = suffix_text(base_url, model, suffix_tokens)
-
     fresh_predict = max(64, min(128, n_predict))
     fresh = completion(base_url, model, prefix, fresh_predict)
-
-    # Deliberately branch from the cached prefix instead of appending the first
-    # generation. This forces the cache/rollback path that previously exposed
-    # Transit ownership and speculative verification bugs.
-    branch_prompt = prefix + suffix
-    branch = completion(base_url, model, branch_prompt, n_predict)
-
+    branch = completion(base_url, model, prefix + suffix, n_predict)
     result = {
         "model": model,
         "prefix_tokens_target": prefix_tokens,
@@ -153,15 +133,15 @@ def main():
     ap.add_argument("--n-predict", type=int, default=256)
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--absolute-tg-floor", type=float, default=5.0)
-    ap.add_argument("--min-self-retention", type=float, default=0.50,
-                    help="branch TG must retain this fraction of the same model's fresh TG")
-    ap.add_argument("--max-vs-baseline-loss", type=float, default=5.0,
-                    help="candidate branch median may not trail baseline by more than this percent")
+    ap.add_argument("--min-self-retention", type=float, default=0.50)
+    ap.add_argument("--max-vs-baseline-loss", type=float, default=5.0)
+    ap.add_argument("--max-acceptance-drop-pp", type=float, default=5.0)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--out", default="/app/share/openclaw_tools/logs/flashnext-stage10-cached-largepp.json")
     args = ap.parse_args()
 
     data = {
+        "schema_version": 2,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "url": args.url,
         "baseline": args.baseline,
@@ -176,8 +156,6 @@ def main():
         "runs": [],
     }
 
-    # Alternate to reduce thermal/order bias: B,R2,R2,B for two repeats, then
-    # generalize the same mirrored pattern for larger repeat counts.
     sequence = []
     for i in range(args.repeats):
         sequence.extend((args.baseline, args.r2) if i % 2 == 0 else (args.r2, args.baseline))
@@ -214,12 +192,16 @@ def main():
             "branch_acceptance_median": acceptance,
             "self_retention": self_retention,
             "branch_cache_values": [x["branch"].get("cache_n") for x in rr],
-            "all_full_generation": all(x["fresh"].get("full_generation") and x["branch"].get("full_generation") for x in rr),
+            "all_full_generation": bool(rr) and all(x["fresh"].get("full_generation") and x["branch"].get("full_generation") for x in rr),
+            "all_mtp_counters": bool(rr) and all(x["fresh"].get("mtp_valid") and x["branch"].get("mtp_valid") for x in rr),
         }
 
     b = summary[args.baseline]
     r = summary[args.r2]
     vs_base = pct(r["branch_tg_median"], b["branch_tg_median"])
+    acc_delta_pp = None
+    if isinstance(b["branch_acceptance_median"], (int, float)) and isinstance(r["branch_acceptance_median"], (int, float)):
+        acc_delta_pp = (r["branch_acceptance_median"] - b["branch_acceptance_median"]) * 100.0
     candidate_outputs = [x["branch"].get("content", "") for x in rows(args.r2)]
     baseline_outputs = [x["branch"].get("content", "") for x in rows(args.baseline)]
     exact_each = bool(candidate_outputs and baseline_outputs) and len(set(candidate_outputs)) == 1 and len(set(baseline_outputs)) == 1
@@ -227,7 +209,8 @@ def main():
 
     gates = {
         "fixed_generation": b["all_full_generation"] and r["all_full_generation"],
-        "acceptance_present": isinstance(b["branch_acceptance_median"], (int, float)) and isinstance(r["branch_acceptance_median"], (int, float)),
+        "all_mtp_counters": b["all_mtp_counters"] and r["all_mtp_counters"],
+        "acceptance_delta": isinstance(acc_delta_pp, (int, float)) and acc_delta_pp >= -args.max_acceptance_drop_pp,
         "absolute_tg_floor": isinstance(r["branch_tg_median"], (int, float)) and r["branch_tg_median"] >= args.absolute_tg_floor,
         "self_retention": isinstance(r["self_retention"], (int, float)) and r["self_retention"] >= args.min_self_retention,
         "vs_baseline": isinstance(vs_base, (int, float)) and vs_base >= -args.max_vs_baseline_loss,
@@ -237,6 +220,7 @@ def main():
 
     data["summary"] = summary
     data["candidate_vs_baseline_branch_tg_pct"] = vs_base
+    data["candidate_vs_baseline_acceptance_delta_pp"] = acc_delta_pp
     data["gates"] = gates
     data["verdict"] = verdict
 
@@ -248,11 +232,11 @@ def main():
         "baseline": b,
         "candidate": r,
         "candidate_vs_baseline_branch_tg_pct": vs_base,
+        "candidate_vs_baseline_acceptance_delta_pp": acc_delta_pp,
         "gates": gates,
         "verdict": verdict,
         "result": str(out),
     }, ensure_ascii=False, indent=2))
-
     raise SystemExit(0 if verdict == "PASS" else 2)
 
 
