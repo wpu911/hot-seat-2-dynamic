@@ -41,6 +41,14 @@ def latest(pattern: str) -> Path | None:
     return max(paths, key=lambda p: p.stat().st_mtime) if paths else None
 
 
+def newer_or_equal(child: Path | None, parent: Path | None) -> bool:
+    if not child or not child.is_file():
+        return False
+    if not parent or not parent.is_file():
+        return True
+    return child.stat().st_mtime >= parent.stat().st_mtime
+
+
 def json_gate(path: Path | None, key="gate") -> str | None:
     if not path or not path.is_file():
         return None
@@ -101,6 +109,11 @@ def main():
     p6b = latest(str(logs / "flashnext-r2-phase6b-ratio-*/summary.env")); p6bd = env_file(p6b)
     poc = latest(str(logs / "flashnext-r2-final-openclaw-*/summary.env")); pocd = env_file(poc)
 
+    p6b_current = p6d.get("PHASE6_WINNER_MODE") == "TENSOR_1x1" and newer_or_equal(p6b, p6)
+    effective_p6bd = p6bd if p6b_current else {}
+    final_winner = effective_p6bd.get("PHASE6B_WINNER_ALIAS") or p6d.get("PHASE6_WINNER_ALIAS") or p5d.get("PHASE5_WINNER_ALIAS")
+    openclaw_current = newer_or_equal(poc, p6b if p6b_current else (p6 or p5))
+
     print("=== Flash Next R2 state report ===")
     print(f"config_exists={config.is_file()}")
     print(f"production_alias_present={PROD in aliases}")
@@ -111,6 +124,8 @@ def main():
     print(f"phase3_manifest={phase3_manifest.is_file()} alias={FINAL in aliases}")
     print(f"phase6_manifest={phase6_manifest.is_file()} layer_alias={LAYER in aliases} tensor_alias={TENSOR in aliases}")
     print(f"phase6b_ratio_manifest={ratio_manifest.is_file()}")
+    print(f"phase6b_summary_current={p6b_current}")
+    print(f"effective_final_winner={final_winner}")
     print()
 
     show_summary("phase1", p1, p1d, ("FOUNDATION_RESULT","MTP_RESULT","TOPK_SMOKE_RESULT","TOPK_FULL_RESULT","PRODUCTION_PROMOTED","FINISHED"))
@@ -137,7 +152,6 @@ def main():
         return
 
     topk_decided = p1d.get("TOPK_SMOKE_RESULT") in {"PASS", "REJECT", "FAIL", "HIP_GRAPH_INTERACTION"}
-    final_winner = p6bd.get("PHASE6B_WINNER_ALIAS") or p6d.get("PHASE6_WINNER_ALIAS") or p5d.get("PHASE5_WINNER_ALIAS")
 
     if not foundation_manifest.is_file() or FOUNDATION not in aliases:
         nxt = "bash flashnext-r2/scripts/run_phase1_real_ab.sh"
@@ -175,12 +189,12 @@ def main():
     elif p6d.get("PHASE6_WINNER_MODE") == "TENSOR_1x1" and not ratio_manifest.is_file():
         nxt = "bash flashnext-r2/scripts/prepare_phase6b_tensor_ratio_sweep.sh"
         why = "Tensor 1:1 won; heterogeneous ratio arms are not prepared."
-    elif p6d.get("PHASE6_WINNER_MODE") == "TENSOR_1x1" and not p6bd.get("PHASE6B_WINNER_ALIAS"):
+    elif p6d.get("PHASE6_WINNER_MODE") == "TENSOR_1x1" and (not p6b_current or not p6bd.get("PHASE6B_WINNER_ALIAS")):
         nxt = "bash flashnext-r2/scripts/run_phase6b_verified.sh"
-        why = "Ratio arms exist but verified Phase-6b sweep is incomplete."
-    elif pocd.get("OPENCLAW_REGRESSION") != "PASS" or pocd.get("WINNER_ALIAS") != final_winner:
+        why = "Tensor 1:1 won, but the Phase-6b result is absent or older than the current Phase-6 decision."
+    elif not openclaw_current or pocd.get("OPENCLAW_REGRESSION") != "PASS" or pocd.get("WINNER_ALIAS") != final_winner:
         nxt = "python3 flashnext-r2/scripts/run_final_openclaw_regression.py"
-        why = f"llama-swap winner {final_winner or 'UNKNOWN'} has not passed a matching real OpenClaw Gateway session regression."
+        why = f"llama-swap winner {final_winner or 'UNKNOWN'} has not passed a matching current OpenClaw Gateway session regression."
     else:
         nxt = f"READY_FOR_PROMOTION_REVIEW winner={final_winner or 'UNKNOWN'}"
         why = "All R2 performance/correctness gates and the matching OpenClaw Gateway regression passed. Promotion is still a separate explicit operation."
