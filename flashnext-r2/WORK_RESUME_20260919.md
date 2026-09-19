@@ -54,7 +54,7 @@ bash flashnext-r2/scripts/prepare_phase3_final_candidate.sh
 bash flashnext-r2/scripts/run_phase3_final_validation.sh
 ```
 
-Phase-3 validation 在大规模 benchmark 前会硬检查最终 runtime：
+Phase-3 validation 在大规模 benchmark 前先把实验 runtime 的 build-tree RUNPATH 归一到 `$ORIGIN`，随后硬检查：
 
 ```text
 llama-server / llama-server.real
@@ -67,36 +67,81 @@ native recurrent rollback
 
 然后才跑 short / 4K-128K / cached Large-PP / rollback。
 
-## 4. Phase-4 / Phase-5
+## 4. Phase-4：MTP depth + HIP Graph
 
-Phase-4：
+入口：
 
 ```bash
 bash flashnext-r2/scripts/run_phase4_mtp_graph_sweep.sh
 ```
 
-只扫：
+现在实际扫描：
 
 ```text
-MTP n-max 2 / 3 / 4
+MTP n-max 1 / 2 / 3 / 4
 HIP Graph ON / OFF
 ```
 
-Phase-5 准备：
+MTP 不再用三组两两 A/B，而是同一个真实 runtime、四个 llama-swap alias 做镜像顺序：
 
-```bash
-bash flashnext-r2/scripts/prepare_phase5_gdn_microfusion.sh
+```text
+1 -> 2 -> 3 -> 4 -> 4 -> 3 -> 2 -> 1
 ```
 
-测速使用 runtime hard-audit 入口，不再直接跑裸 runner：
+每个 leg 都重新加载、warm-up 后再测速，固定 TG512，并要求每个样本都有 `draft_n / draft_n_accepted`。输出会再 tokenize，默认保护前 128 个生成 token：四个 depth 必须与 n-max=2 anchor 的保护前缀一致。出现坏 arm 时只淘汰那个 arm，不让它把整个 sweep 一锅端掉。
+
+选择规则不是“0.2% 也算赢”。非 anchor 默认至少比 n-max=2 的 median TG 快 1%，否则继续保留 n-max=2。外部机器有人测到 n-max=1 最好，也有人测到 3/4 最好，所以这台 gfx1100 + gfx1201 异构双卡自己测，别替别人继承甜点参数。
+
+HIP Graph 仍然必须 A/B。当前 ROCm graph exec update 上游修复尚未落地，不能把 Graph ON 当成天然更快。
+
+## 5. Phase-4b：参数 winner 深水区复验
+
+Phase-4 只负责选参数，**不允许直接把 winner 送进源码级 GDN 实验**。先跑：
 
 ```bash
+bash flashnext-r2/scripts/run_phase4b_param_validation.sh
+```
+
+固定三关：
+
+```text
+32K / 64K / 128K retrieval + TG
+16K cached Large-PP / high-LCP
+64K recurrent rollback + MTP
+```
+
+如果 Phase-4 参数 winner 在任何一关失败，不中断整个 R2 流程，而是明确记录：
+
+```text
+PARAM_ACCEPTED=NO
+PHASE4B_WINNER_ALIAS=qwen3.8-flash-next-r2-final-pre-sweep:256k
+```
+
+也就是退回已经通过 Phase-3 的安全基线。`VALIDATION=PASS` 在这种情况下表示“安全 fallback 已确定”，不是“参数 candidate 通过”，判断 candidate 要看 `PARAM_ACCEPTED`。这种字段区分虽然少了点浪漫，但能防止以后的人类把 fallback 当冠军。
+
+## 6. Phase-5：GDN microfusion
+
+Phase-5 必须从 Phase-4b 的 winner 准备：
+
+```bash
+bash flashnext-r2/scripts/prepare_phase5_from_phase4b.sh
 bash flashnext-r2/scripts/run_phase5_verified.sh
 ```
 
-它会先验证 Phase-5 新编 binary 的共享库、临时 build 依赖和双卡可见性，再进入 GDN OFF / PROLOG / PROLOG+L2 A/B。
+不要再直接从旧 Phase-4 summary 调 `prepare_phase5_gdn_microfusion.sh`。
 
-## 5. Phase-6：双卡 split 是重点
+`run_phase5_verified.sh` 会先：
+
+```text
+normalize staged runtime RUNPATH
+检查共享库解析
+禁止临时 build 目录依赖
+确认 gfx1100 + gfx1201
+```
+
+然后才进入 GDN OFF / PROLOG / PROLOG+L2 A/B、cached Large-PP 和 rollback。
+
+## 7. Phase-6：双卡 split 是重点
 
 准备：
 
@@ -110,7 +155,7 @@ bash flashnext-r2/scripts/prepare_phase6_tensor_split.sh
 bash flashnext-r2/scripts/run_phase6_verified.sh
 ```
 
-它会先确认：
+入口现在会先归一 layer / tensor 两套 staged runtime 的 RUNPATH，再确认：
 
 ```text
 layer / tensor wrapper 的 real ELF SHA256 完全一致
@@ -122,9 +167,9 @@ gfx1100 + gfx1201 均可见
 
 然后才执行 short exact A/B、4K/32K/64K/128K、cached Large-PP、64K recurrent rollback。
 
-`analyze_exact_ab.py` 当前要求 benchmark schema v3、固定 TG、完整 `predicted_n`，并要求每一个 TG sample 都存在 MTP `draft_n / draft_n_accepted`。缺 acceptance 不再算过。
+`analyze_exact_ab.py` 要求 benchmark schema v3、固定 TG、完整 `predicted_n`，并要求每一个 TG sample 都存在 MTP `draft_n / draft_n_accepted`。缺 acceptance 不再算过。
 
-## 6. Phase-6b：24G + 32G 异构比例
+## 8. Phase-6b：24G + 32G 异构比例
 
 仅当 Phase-6 winner 是 `TENSOR_1x1` 才准备：
 
@@ -138,11 +183,11 @@ bash flashnext-r2/scripts/prepare_phase6b_tensor_ratio_sweep.sh
 bash flashnext-r2/scripts/run_phase6b_verified.sh
 ```
 
-它会验证 EVEN/MID/CAP 三个 wrapper 使用同一个 real ELF，并且实际 ratio 与 `phase6b-ratios.env` 完全一致。
+verified 入口会先归一 EVEN/MID/CAP 三套 staged runtime，再验证三者使用同一个 real ELF，并且实际 ratio 与 `phase6b-ratios.env` 完全一致。
 
-## 7. 当前 rollback / cached gate 的硬要求
+## 9. 当前 rollback / cached gate 的硬要求
 
-最新版本已经统一为：
+最新版本统一为：
 
 ```text
 ignore_eos=true
@@ -150,12 +195,12 @@ ignore_eos=true
 必须看到 MTP draft_n / draft_n_accepted
 cached branch 的 MTP acceptance 不得明显恶化
 rollback stress 每一个 leg 都必须实际走 MTP
-needle / deterministic prefix 必须正确
+needle / deterministic protected prefix 必须正确
 ```
 
 因此，旧的“没有 acceptance 但 TG 看起来挺快”结果全部视为不可信。快得连推测解码有没有工作都不知道，那不叫优化，叫计时器有想法。
 
-## 8. 绝对不要自动做的事
+## 10. 绝对不要自动做的事
 
 ```text
 不要覆盖 qwen3.8-flash-next:256k
@@ -180,6 +225,6 @@ rollback
 OpenClaw 实际 session
 ```
 
-## 9. Work 最简接管指令
+## 11. Work 最简接管指令
 
-> 先更新 `flashnext-r2-20260918` 分支，然后运行 `python3 flashnext-r2/scripts/report_r2_state.py`。严格根据它输出的 `NEXT_ACTION` 从现有真实机器状态继续。所有 benchmark 统一走 llama-swap `127.0.0.1:8090`。不得自动替换生产 alias `qwen3.8-flash-next:256k`。Phase-5、Phase-6 和 Phase-6b 分别使用 `run_phase5_verified.sh`、`run_phase6_verified.sh` 和 `run_phase6b_verified.sh`。遇到 FAIL 时保留结果并退回上一 winner，不要为了让 gate 变绿而放宽正确性条件。
+> 先更新 `flashnext-r2-20260918` 分支，然后运行 `python3 flashnext-r2/scripts/report_r2_state.py`。严格根据它输出的 `NEXT_ACTION` 从现有真实机器状态继续。所有 benchmark 统一走 llama-swap `127.0.0.1:8090`。不得自动替换生产 alias `qwen3.8-flash-next:256k`。Phase-4 后必须跑 `run_phase4b_param_validation.sh`，Phase-5 必须通过 `prepare_phase5_from_phase4b.sh` 接收验证后的 winner。Phase-5、Phase-6、Phase-6b 测速分别使用 `run_phase5_verified.sh`、`run_phase6_verified.sh`、`run_phase6b_verified.sh`。遇到 FAIL 时保留结果并退回上一安全 winner，不要为了让 gate 变绿而放宽正确性条件。
