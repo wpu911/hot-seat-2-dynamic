@@ -37,12 +37,16 @@ curl -fsS --max-time 20 http://127.0.0.1:8090/v1/models > "$RUN_DIR/models-prefl
   echo "ERROR llama-swap :8090 unhealthy" >&2; exit 7;
 }
 
-# Gate -1: staged runtime itself. If PLE won, llama-server is a shell wrapper and
-# the ELF is llama-server.real; ldd/readelf must inspect the real executable.
-echo "=== Gate -1: final runtime bundle / dual-GPU audit ==="
+# Gate -1: normalize and audit the staged runtime itself. Some older Work runs
+# copied build/bin while CMake still embedded an absolute build-tree RUNPATH. It
+# works until the build tree is cleaned, which is the sort of delayed surprise
+# computers reserve for people who thought deployment was finished.
+echo "=== Gate -1: final runtime isolation / dual-GPU audit ==="
+OUT="$RUN_DIR/runtime-rpath-normalize.log" \
+  bash "$SCRIPT_DIR/normalize_runtime_rpath.sh" "$FINAL_RUNTIME"
 AUDIT_SERVER="$FINAL_RUNTIME/llama-server"
 [[ -x "$FINAL_RUNTIME/llama-server.real" ]] && AUDIT_SERVER="$FINAL_RUNTIME/llama-server.real"
-SERVER="$AUDIT_SERVER" REQUIRE_BOTH_GPUS=1 \
+SERVER="$AUDIT_SERVER" REQUIRE_BOTH_GPUS=1 OUT="$RUN_DIR/runtime-verify.log" \
   bash "$SCRIPT_DIR/verify_runtime_bundle.sh" "$FINAL_RUNTIME"
 note "RUNTIME_BUNDLE=PASS"
 note "RUNTIME_SERVER_SHA256=$(sha256sum "$AUDIT_SERVER" | awk '{print $1}')"
@@ -97,7 +101,9 @@ python3 "$SCRIPT_DIR/bench_stage10_cached_largepp.py" \
   --n-predict "${CACHED_TG:-512}" --repeats "${CACHED_REPEATS:-2}" \
   --absolute-tg-floor "${CACHED_TG_FLOOR:-5.0}" \
   --min-self-retention "${CACHED_SELF_RETENTION:-0.50}" \
-  --max-vs-baseline-loss "${CACHED_MAX_LOSS:-5.0}" --out "$CACHED_JSON"
+  --max-vs-baseline-loss "${CACHED_MAX_LOSS:-5.0}" \
+  --max-acceptance-drop-pp "${CACHED_MAX_ACC_DROP_PP:-5.0}" \
+  --out "$CACHED_JSON"
 note "CACHED_GATE=PASS"
 note "CACHED_RESULT=$CACHED_JSON"
 
