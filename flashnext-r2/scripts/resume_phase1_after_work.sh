@@ -42,28 +42,39 @@ bash "$SCRIPT_DIR/verify_modern_foundation_carryover.sh"
 env SRC="$FOUNDATION_SRC" CONFIG="$CONFIG" ALIAS="$FOUNDATION_ALIAS" \
   bash "$SCRIPT_DIR/verify_qwen4exp_native_rs_rollback.sh"
 
-analysis_passes() {
-  [[ -f "$FOUNDATION_ANALYSIS" ]] || return 1
-  python3 - "$FOUNDATION_ANALYSIS" <<'PY'
-import json, sys
-p=sys.argv[1]
-try:
-    x=json.load(open(p, encoding='utf-8'))
-except Exception:
-    raise SystemExit(1)
-raise SystemExit(0 if x.get('gate',{}).get('result') == 'PASS' else 1)
-PY
+# Never trust a stale analysis file on its own. Work may have produced it with an
+# older benchmark that allowed early EOS or failed to read timings.draft_n. Re-run
+# the CURRENT analyzer over the raw JSON. Legacy raw results intentionally fail the
+# fixed_tg schema gate and trigger one fresh A/B instead of being silently reused.
+revalidate_existing_result() {
+  [[ -f "$FOUNDATION_RESULT" ]] || return 1
+  echo "FOUNDATION_AB_REVALIDATE=$FOUNDATION_RESULT"
+  set +e
+  python3 "$SCRIPT_DIR/analyze_modern_foundation.py" \
+    "$FOUNDATION_RESULT" --baseline "$PROD_ALIAS" --foundation "$FOUNDATION_ALIAS" \
+    --max-median-tg-loss "${MAX_MEDIAN_TG_LOSS:-2.0}" \
+    --max-workload-tg-loss "${MAX_WORKLOAD_TG_LOSS:-3.0}" \
+    --max-median-pp-loss "${MAX_MEDIAN_PP_LOSS:-3.0}" \
+    --max-acceptance-drop-pp "${MAX_ACCEPTANCE_DROP_PP:-2.0}"
+  local rc=$?
+  set -e
+  return "$rc"
 }
 
-if analysis_passes; then
+if revalidate_existing_result; then
   echo "FOUNDATION_AB_REUSE=PASS"
   echo "analysis=$FOUNDATION_ANALYSIS"
 else
+  if [[ -f "$FOUNDATION_RESULT" ]]; then
+    STALE="$FOUNDATION_RESULT.stale-$(date +%Y%m%d-%H%M%S)"
+    cp -a "$FOUNDATION_RESULT" "$STALE"
+    echo "FOUNDATION_AB_OLD_RESULT_SAVED=$STALE"
+  fi
   echo "FOUNDATION_AB_REUSE=NO"
   echo "Running a fresh fixed-length foundation A/B through llama-swap :8090"
   OUT="$FOUNDATION_RESULT" bash "$SCRIPT_DIR/run_modern_foundation_ab.sh"
-  analysis_passes || {
-    echo "ERROR: Modern Foundation did not pass the gate; stop before MTP." >&2
+  revalidate_existing_result || {
+    echo "ERROR: Modern Foundation did not pass the current gate; stop before MTP." >&2
     exit 10
   }
 fi
