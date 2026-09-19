@@ -4,6 +4,9 @@
 The foundation's job is compatibility first, speed second. It must preserve the
 production deterministic outputs, MTP acceptance and throughput within tight
 bounds. Any genuine speedup is recorded but is not required for PASS.
+
+Important: this analyzer deliberately rejects legacy benchmark JSON that predates
+fixed-length TG. A stale PASS from the old early-EOS benchmark is not evidence.
 """
 from __future__ import annotations
 import argparse, json, statistics
@@ -24,16 +27,27 @@ def collect(data,model):
     pp={}
     for k in sorted({k for l in legs for k in l.get("pp",{})},key=lambda x:int(x)):
         pp[k]=med([r.get("pp") for l in legs for r in l.get("pp",{}).get(k,[])])
-    tg={}; acc={}; out={}
+    tg={}; acc={}; out={}; full={}; pred={}; samples={}
+    requested=data.get("requested_tg")
     for w in WORKLOADS:
         rs=[r for l in legs for r in l.get("tg",[]) if r.get("workload")==w]
+        samples[w]=len(rs)
         tg[w]=med([r.get("tg") for r in rs])
         av=[]
         for r in rs:
             d,a=r.get("drafted"),r.get("accepted")
             if isinstance(d,(int,float)) and d>0 and isinstance(a,(int,float)): av.append(a/d)
-        acc[w]=med(av); out[w]=[r.get("content","") for r in rs]
-    return {"legs":len(legs),"pp":pp,"tg":tg,"acceptance":acc,"outputs":out}
+        acc[w]=med(av)
+        out[w]=[r.get("content","") for r in rs]
+        full[w]=bool(rs) and all(r.get("full_generation") is True for r in rs)
+        pred[w]=[
+            r.get("predicted_n") for r in rs
+            if isinstance(r.get("predicted_n"),(int,float))
+        ]
+        if isinstance(requested,(int,float)):
+            full[w]=full[w] and len(pred[w])==len(rs) and all(x>=requested for x in pred[w])
+    return {"legs":len(legs),"pp":pp,"tg":tg,"acceptance":acc,"outputs":out,
+            "full_generation":full,"predicted_n":pred,"samples":samples}
 
 def stable_equal(a,b):
     return bool(a) and bool(b) and len(set(a))==1 and len(set(b))==1 and a[0]==b[0]
@@ -49,6 +63,12 @@ def main():
     ap.add_argument("--max-acceptance-drop-pp",type=float,default=2.0)
     args=ap.parse_args()
     data=json.loads(Path(args.result).read_text(encoding="utf-8"))
+
+    # Schema gate. Old runs did not force fixed-length generation and could report
+    # attractive TG after only a few generated tokens. Never recycle those runs.
+    requested=data.get("requested_tg")
+    fixed_schema=(data.get("fixed_tg") is True and isinstance(requested,(int,float)) and requested>0)
+
     b=collect(data,args.baseline); f=collect(data,args.foundation)
     td={w:pct(f["tg"].get(w),b["tg"].get(w)) for w in WORKLOADS}
     pd={k:pct(f["pp"].get(k),b["pp"].get(k)) for k in sorted(set(b["pp"])|set(f["pp"]),key=lambda x:int(x))}
@@ -61,15 +81,31 @@ def main():
     pvals=[x for x in pd.values() if isinstance(x,(int,float))]
     avals=[x for x in ad.values() if isinstance(x,(int,float))]
     tmed=med(tvals); tworst=min(tvals) if tvals else None; pmed=med(pvals); aworst=min(avals) if avals else None
+
+    # Foundation and production are both MTP aliases here. Missing acceptance is a
+    # measurement failure, not a neutral result. Require all three workloads.
+    acceptance_complete=all(
+        isinstance(b["acceptance"].get(w),(int,float)) and
+        isinstance(f["acceptance"].get(w),(int,float))
+        for w in WORKLOADS
+    )
+    fixed_complete=(fixed_schema and all(b["full_generation"].values()) and all(f["full_generation"].values()))
+    sample_complete=all(b["samples"].get(w,0)>0 and f["samples"].get(w,0)>0 for w in WORKLOADS)
+
     checks={
+      "fixed_tg_schema":fixed_schema,
+      "fixed_generation_complete":fixed_complete,
+      "samples_complete":sample_complete,
       "bit_exact":all(exact.values()),
       "median_tg":tmed is not None and tmed>=-args.max_median_tg_loss,
       "worst_tg":tworst is not None and tworst>=-args.max_workload_tg_loss,
       "median_pp":pmed is not None and pmed>=-args.max_median_pp_loss,
-      "acceptance":aworst is not None and aworst>=-args.max_acceptance_drop_pp,
+      "acceptance_present":acceptance_complete,
+      "acceptance":acceptance_complete and aworst is not None and aworst>=-args.max_acceptance_drop_pp,
     }
     result="PASS" if all(checks.values()) else "FAIL"
     report={"baseline":args.baseline,"foundation":args.foundation,
+      "benchmark_schema":{"fixed_tg":data.get("fixed_tg"),"requested_tg":requested},
       "baseline_metrics":{k:v for k,v in b.items() if k!="outputs"},
       "foundation_metrics":{k:v for k,v in f.items() if k!="outputs"},
       "tg_delta_pct":td,"pp_delta_pct":pd,"acceptance_delta_percentage_points":ad,
@@ -77,10 +113,10 @@ def main():
       "gate":{"result":result,"median_tg_delta_pct":tmed,"worst_tg_delta_pct":tworst,
               "median_pp_delta_pct":pmed,"worst_acceptance_delta_pp":aworst}}
     for w in WORKLOADS:
-        print(f"{w:>5} TG {b['tg'].get(w)} -> {f['tg'].get(w)} ({td[w]}%)  accΔ={ad[w]}pp exact={exact[w]}")
+        print(f"{w:>5} TG {b['tg'].get(w)} -> {f['tg'].get(w)} ({td[w]}%)  accΔ={ad[w]}pp exact={exact[w]} fixed={b['full_generation'].get(w) and f['full_generation'].get(w)}")
     for k in sorted(pd,key=lambda x:int(x)):
         print(f"PP {k:>5} {b['pp'].get(k)} -> {f['pp'].get(k)} ({pd[k]}%)")
-    print(json.dumps(report["gate"],ensure_ascii=False,indent=2))
+    print(json.dumps({"checks":checks,"gate":report["gate"]},ensure_ascii=False,indent=2))
     out=Path(args.result).with_suffix(".foundation-analysis.json")
     out.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding="utf-8")
     print(f"ANALYSIS={out}")
