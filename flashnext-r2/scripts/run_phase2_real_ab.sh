@@ -6,6 +6,7 @@ set -euo pipefail
 # This starts only after Phase-1 produced a valid Modern MTP candidate. It treats
 # candidate rejection as a result, not as a reason to stop unrelated experiments:
 #   - TOP_K is confirmed/rejected first because QSA may layer on top of it.
+#   - RDNA4 FA256 then tests the R9700 head-dim-256 prefill path on that base.
 #   - QSA gather is smoke-tested then fully confirmed.
 #   - pooled-key cache runs only if QSA gather fully passes, then rollback stress.
 #   - PLE direct-read and FR-Spec are independent branches off Modern MTP and are
@@ -123,6 +124,47 @@ else
     *)                     note "TOPK_FINAL=NOT_SELECTED" ;;
   esac
 fi
+note "PRE_FA_BASE_SRC=$LONG_BASE_SRC"
+note "PRE_FA_BASE_ALIAS=$LONG_BASE_ALIAS"
+
+# ---------------- Stage 15: RDNA4 head-dim-256 FlashAttention ----------------
+# This is placed before QSA because it accelerates deep prefill on the R9700 and
+# is independent of QSA's selected-row decode work. The three-arm experiment
+# separates PR26419 kernel carryover (BASE->OFF) from the new RDNA4 route
+# (OFF->ON). Only a full PASS becomes the base for QSA/pooled-cache composition.
+FA256_SRC="${FA256_SRC:-/app/share/llama_box/src/llama.cpp-flashnext-r2-rdna4-fa256-20260919}"
+FA256_OFF="${FA256_OFF:-qwen3.8-flash-next-r2-rdna4-fa256-off:256k}"
+FA256_ON="${FA256_ON:-qwen3.8-flash-next-r2-rdna4-fa256-on:256k}"
+FA256_PASS=0
+
+echo
+echo "=== Stage 15 RDNA4 FA256 ==="
+if [[ ! -f "$FA256_SRC/r2-meta/stage15-rdna4-fa256-manifest.txt" ]]; then
+  env BASE_SRC="$LONG_BASE_SRC" BASE_ALIAS="$LONG_BASE_ALIAS" \
+    bash "$SCRIPT_DIR/prepare_stage15_rdna4_fa256.sh"
+else
+  echo "FA256_PREPARE_SKIP existing recorded candidate"
+  REC_FA_BASE="$(awk -F= '$1=="base_source"{print substr($0,index($0,"=")+1)}' "$FA256_SRC/r2-meta/stage15-rdna4-fa256-manifest.txt")"
+  REC_FA_ALIAS="$(awk -F= '$1=="base_alias"{print substr($0,index($0,"=")+1)}' "$FA256_SRC/r2-meta/stage15-rdna4-fa256-manifest.txt")"
+  if [[ "$REC_FA_BASE" != "$LONG_BASE_SRC" || "$REC_FA_ALIAS" != "$LONG_BASE_ALIAS" ]]; then
+    echo "ERROR existing FA256 candidate was prepared from another base." >&2
+    echo "recorded base=$REC_FA_BASE alias=$REC_FA_ALIAS" >&2
+    echo "wanted   base=$LONG_BASE_SRC alias=$LONG_BASE_ALIAS" >&2
+    exit 25
+  fi
+fi
+require_alias "$FA256_OFF" || exit 26
+require_alias "$FA256_ON" || exit 27
+run_capture FA256_RC env BASE_ALIAS="$LONG_BASE_ALIAS" OFF_ALIAS="$FA256_OFF" ON_ALIAS="$FA256_ON" \
+  bash "$SCRIPT_DIR/run_stage15_rdna4_fa256_ab.sh"
+if [[ "$FA256_RC" == 0 ]]; then
+  FA256_PASS=1
+  LONG_BASE_SRC="$FA256_SRC"
+  LONG_BASE_ALIAS="$FA256_ON"
+  note "FA256_RESULT=PASS"
+else
+  note "FA256_RESULT=REJECT"
+fi
 note "LONG_BASE_SRC=$LONG_BASE_SRC"
 note "LONG_BASE_ALIAS=$LONG_BASE_ALIAS"
 
@@ -231,7 +273,7 @@ note "LONG_WINNER_ALIAS=$LONG_WINNER_ALIAS"
 
 # ---------------- Stage 11: PLE direct-read ----------------
 # Keep this isolated on Modern MTP. It is an I/O/prefill experiment and should
-# not be credited with QSA/TOP_K long-context changes.
+# not be credited with QSA/TOP_K/FA256 long-context changes.
 PLE_SRC="${PLE_SRC:-/app/share/llama_box/src/llama.cpp-flashnext-r2-modern-lazy-direct-20260918}"
 PLE_MMAP="${PLE_MMAP:-qwen3.8-flash-next-r2-modern-lazy-mmap:256k}"
 PLE_DIRECT="${PLE_DIRECT:-qwen3.8-flash-next-r2-modern-lazy-direct:256k}"
@@ -285,6 +327,7 @@ cp -a "$CONFIG" "$RUN_DIR/config-after.yaml"
 sha256sum "$CONFIG" > "$RUN_DIR/config-after.sha256"
 note "PRODUCTION_ALIAS=$PROD_ALIAS"
 note "PRODUCTION_PROMOTED=NO"
+note "FA256_PASS=$FA256_PASS"
 note "PLE_PASS=$PLE_PASS"
 note "FRSPEC_PASS=$FR_PASS"
 note "CONFIG_AFTER=$RUN_DIR/config-after.yaml"
