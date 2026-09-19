@@ -11,6 +11,7 @@ LOG_DIR="${LOG_DIR:-/app/share/openclaw_tools/logs}"
 PROD_ALIAS="${PROD_ALIAS:-qwen3.8-flash-next:256k}"
 FOUNDATION_ALIAS="${FOUNDATION_ALIAS:-qwen3.8-flash-next-r2-modern-foundation:256k}"
 FOUNDATION_SRC="${FOUNDATION_SRC:-/app/share/llama_box/src/llama.cpp-flashnext-modern-foundation-20260918}"
+FOUNDATION_RUNTIME="${FOUNDATION_RUNTIME:-/app/share/llm/Qwen3.8-Flash-Next-GGUF/runtime-text/r2-modern-foundation}"
 FOUNDATION_RESULT="${FOUNDATION_RESULT:-$LOG_DIR/flashnext-r2-modern-foundation-ab.json}"
 FOUNDATION_ANALYSIS="${FOUNDATION_ANALYSIS:-${FOUNDATION_RESULT%.json}.foundation-analysis.json}"
 
@@ -28,6 +29,10 @@ require_alias() {
   echo "ERROR: foundation manifest missing; this is not a resumable prepared candidate" >&2
   exit 5
 }
+[[ -x "$FOUNDATION_RUNTIME/llama-server" ]] || {
+  echo "ERROR: foundation runtime missing: $FOUNDATION_RUNTIME/llama-server" >&2
+  exit 5
+}
 require_alias "$PROD_ALIAS"
 require_alias "$FOUNDATION_ALIAS"
 
@@ -35,6 +40,13 @@ curl -fsS --max-time 20 http://127.0.0.1:8090/v1/models >/dev/null || {
   echo "ERROR: llama-swap :8090 unhealthy" >&2
   exit 6
 }
+
+# Runtime packaging is part of correctness. A binary that quietly resolves local
+# libllama/libggml from the disposable CMake build tree is not a real independent
+# experiment runtime and may die after cleanup.
+REQUIRE_BOTH_GPUS="${REQUIRE_BOTH_GPUS:-1}" \
+  OUT="$LOG_DIR/flashnext-r2-foundation-runtime-verify.log" \
+  bash "$SCRIPT_DIR/verify_runtime_bundle.sh" "$FOUNDATION_RUNTIME"
 
 # Re-run the two source/runtime gates before trusting an experiment prepared by an
 # interrupted session. This is cheap compared with loading the 190+ GiB model.
