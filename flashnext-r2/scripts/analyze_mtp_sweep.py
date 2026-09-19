@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Analyze a Flash Next MTP draft-depth sweep.
 
-Unlike the old 2/3/4 helper, this accepts any number of result JSON files and any
-number of candidate aliases. It is intentionally strict about benchmark validity:
-fixed-length TG, complete generations and MTP draft/accept counters are required
-for every measured TG sample.
+This accepts any number of result JSON files and candidate aliases. It is strict
+about benchmark validity: fixed-length TG, complete generations and MTP
+draft/accept counters are required for every measured TG sample.
+
+Speculative correctness is checked on a protected generated-token prefix rather
+than on an entire long string. That is deliberate: late greedy divergence can
+come from backend reduction ties even with the same arm, while an early prefix
+mismatch is strong evidence that changing draft depth changed semantics.
 
 A bad arm is rejected instead of poisoning the whole sweep. The anchor arm must
 remain valid. A faster arm is recommended only when its median gain over the
@@ -42,9 +46,12 @@ def load_rows(paths):
             "fixed_tg": data.get("fixed_tg"),
             "requested_tg": data.get("requested_tg"),
             "sequence": data.get("sequence"),
+            "output_tokens_recorded": data.get("output_tokens_recorded"),
         })
         if data.get("schema_version") != 3 or data.get("fixed_tg") is not True:
             raise SystemExit(f"ERROR stale/unsafe benchmark schema in {p}: require schema_version=3 fixed_tg=true")
+        if data.get("output_tokens_recorded") is not True:
+            raise SystemExit(f"ERROR {p} lacks tokenized output; rerun with current bench_mtp_depth_sweep.py")
         requested = data.get("requested_tg")
         if not isinstance(requested, int) or requested <= 0:
             raise SystemExit(f"ERROR invalid requested_tg in {p}: {requested!r}")
@@ -54,7 +61,7 @@ def load_rows(paths):
             if not isinstance(m, str) or not m:
                 continue
             slot = by_model.setdefault(m, {
-                "tg": {}, "outputs": {}, "accept": {}, "full": {}, "mtp_complete": {},
+                "tg": {}, "tokens": {}, "accept": {}, "full": {}, "mtp_complete": {},
                 "leg_count": 0,
             })
             slot["leg_count"] += 1
@@ -63,7 +70,8 @@ def load_rows(paths):
                 if w not in WORKLOADS:
                     continue
                 slot["tg"].setdefault(w, []).append(row.get("tg"))
-                slot["outputs"].setdefault(w, []).append(row.get("content", ""))
+                ids = row.get("output_tokens")
+                slot["tokens"].setdefault(w, []).append(ids if isinstance(ids, list) else None)
                 pred = row.get("predicted_n")
                 full = bool(row.get("full_generation")) and isinstance(pred, (int, float)) and pred >= requested
                 slot["full"].setdefault(w, []).append(full)
@@ -75,27 +83,38 @@ def load_rows(paths):
     return by_model, source_meta
 
 
+def prefix_tuple(ids, n):
+    if not isinstance(ids, list) or len(ids) < n or not all(isinstance(x, int) for x in ids[:n]):
+        return None
+    return tuple(ids[:n])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("results", nargs="+")
     ap.add_argument("--anchor", default="qwen3.8-flash-next-r2-final-mtp2:256k")
     ap.add_argument("--min-gain", type=float, default=1.0,
                     help="minimum median TG gain over anchor before changing draft depth")
+    ap.add_argument("--exact-prefix-tokens", type=int, default=128,
+                    help="generated token prefix that must match anchor across all runs")
     ap.add_argument("--out", default="/app/share/openclaw_tools/logs/flashnext-r2-mtp-sweep.analysis.json")
     args = ap.parse_args()
+    if args.exact_prefix_tokens < 32:
+        raise SystemExit("ERROR --exact-prefix-tokens must be >= 32")
 
     by_model, source_meta = load_rows(args.results)
     if args.anchor not in by_model:
         raise SystemExit(f"ERROR anchor model absent from sweep: {args.anchor}")
 
     # The anchor is the correctness reference, not whichever alias happened to
-    # run first. This matters now that the sweep starts with n-max=1.
-    ref_outputs = {}
+    # run first. Require its own runs to agree on the protected prefix first.
+    ref_prefix = {}
     av = by_model[args.anchor]
     for w in WORKLOADS:
-        outs = av["outputs"].get(w, [])
-        if outs:
-            ref_outputs[w] = outs[0]
+        prefixes = [prefix_tuple(x, args.exact_prefix_tokens) for x in av["tokens"].get(w, [])]
+        prefixes = [x for x in prefixes if x is not None]
+        if prefixes:
+            ref_prefix[w] = prefixes[0]
 
     report = {}
     rejected = []
@@ -103,12 +122,20 @@ def main():
         tg = {w: med(v["tg"].get(w, [])) for w in WORKLOADS}
         acc = {w: med(v["accept"].get(w, [])) for w in WORKLOADS}
         sample_counts = {w: len(v["tg"].get(w, [])) for w in WORKLOADS}
+        token_prefixes = {
+            w: [prefix_tuple(x, args.exact_prefix_tokens) for x in v["tokens"].get(w, [])]
+            for w in WORKLOADS
+        }
+        token_prefix_complete = {
+            w: bool(token_prefixes[w]) and all(x is not None for x in token_prefixes[w])
+            for w in WORKLOADS
+        }
         deterministic = {
-            w: bool(v["outputs"].get(w)) and len(set(v["outputs"].get(w, []))) == 1
+            w: token_prefix_complete[w] and len(set(token_prefixes[w])) == 1
             for w in WORKLOADS
         }
         exact_vs_anchor = {
-            w: bool(v["outputs"].get(w)) and w in ref_outputs and all(x == ref_outputs[w] for x in v["outputs"].get(w, []))
+            w: token_prefix_complete[w] and w in ref_prefix and all(x == ref_prefix[w] for x in token_prefixes[w])
             for w in WORKLOADS
         }
         full_generation = {
@@ -122,6 +149,7 @@ def main():
         coverage = all(sample_counts[w] > 0 for w in WORKLOADS)
         valid = (
             coverage
+            and all(token_prefix_complete.values())
             and all(deterministic.values())
             and all(exact_vs_anchor.values())
             and all(full_generation.values())
@@ -134,8 +162,10 @@ def main():
             "acceptance": acc,
             "sample_counts": sample_counts,
             "leg_count": v["leg_count"],
-            "deterministic_within_model": deterministic,
-            "exact_vs_anchor": exact_vs_anchor,
+            "exact_prefix_tokens": args.exact_prefix_tokens,
+            "token_prefix_complete": token_prefix_complete,
+            "deterministic_prefix_within_model": deterministic,
+            "exact_prefix_vs_anchor": exact_vs_anchor,
             "full_generation": full_generation,
             "mtp_counters_complete": mtp_complete,
             "median_tg": score,
@@ -180,6 +210,7 @@ def main():
         "sources": source_meta,
         "anchor": args.anchor,
         "min_gain_pct": args.min_gain,
+        "exact_prefix_tokens": args.exact_prefix_tokens,
         "models": report,
         "ranking": ranked,
         "rejected_models": rejected,
