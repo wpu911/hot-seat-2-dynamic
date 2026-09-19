@@ -110,6 +110,7 @@ def main():
     p5 = latest(str(logs / "flashnext-r2-phase5-gdn-*/summary.env")); p5d = env_file(p5)
     p6 = latest(str(logs / "flashnext-r2-phase6-tensor-split-*/summary.env")); p6d = env_file(p6)
     p6b = latest(str(logs / "flashnext-r2-phase6b-ratio-*/summary.env")); p6bd = env_file(p6b)
+    pturn = latest(str(logs / "flashnext-r2-mtp-turn-reuse-*/summary.env")); pturnd = env_file(pturn)
     ppar = latest(str(logs / "flashnext-r2-mtp-parallel-isolation-*/summary.env")); ppard = env_file(ppar)
     poc = latest(str(logs / "flashnext-r2-final-openclaw-*/summary.env")); pocd = env_file(poc)
     prev = latest(str(logs / "flashnext-r2-promotion-review-*/summary.env")); prevd = env_file(prev)
@@ -129,13 +130,26 @@ def main():
     effective_p6bd = p6bd if p6b_current else {}
     final_winner = effective_p6bd.get("PHASE6B_WINNER_ALIAS") or p6d.get("PHASE6_WINNER_ALIAS") or p5d.get("PHASE5_WINNER_ALIAS")
     winner_parent = p6b if p6b_current else (p6 or p5)
-    parallel_current = newer_or_equal(ppar, winner_parent)
+
+    # Tail correctness gates are deliberately freshness-chained. A newer winner
+    # invalidates every older tail result; a newer turn-reuse run invalidates an
+    # older parallel-isolation result, and so on. Otherwise yesterday's PASS can
+    # quietly certify today's binary, which is exactly the kind of bookkeeping
+    # trick computers are supposed to save humans from.
+    turn_current = newer_or_equal(pturn, winner_parent)
+    turn_pass = (
+        turn_current
+        and pturnd.get("MTP_TURN_REUSE") == "PASS"
+        and pturnd.get("WINNER_ALIAS") == final_winner
+    )
+    parallel_parent = pturn if turn_pass else winner_parent
+    parallel_current = newer_or_equal(ppar, parallel_parent)
     parallel_pass = (
         parallel_current
         and ppard.get("MTP_PARALLEL_ISOLATION") == "PASS"
         and ppard.get("WINNER_ALIAS") == final_winner
     )
-    openclaw_parent = ppar if parallel_pass else winner_parent
+    openclaw_parent = ppar if parallel_pass else parallel_parent
     openclaw_current = newer_or_equal(poc, openclaw_parent)
     promotion_review_current = newer_or_equal(prev, poc)
 
@@ -152,6 +166,7 @@ def main():
     print(f"phase6b_bidirectional_ready={ratio_manifest_v2}")
     print(f"phase6b_summary_current={p6b_current}")
     print(f"effective_final_winner={final_winner}")
+    print(f"mtp_turn_reuse_gate_current={turn_current} pass={turn_pass}")
     print(f"mtp_parallel_gate_current={parallel_current} pass={parallel_pass}")
     print()
 
@@ -163,6 +178,7 @@ def main():
     show_summary("phase5", p5, p5d, ("THROUGHPUT_MODE","CACHED_GATE","ROLLBACK_GATE","PHASE5_WINNER_MODE","PHASE5_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase6", p6, p6d, ("SHORT_GATE_RC","LONG_GATE_RC","CACHED_GATE","ROLLBACK_GATE","PHASE6_WINNER_MODE","PHASE6_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase6b", p6b, p6bd, ("SMOKE_DECISION","SMOKE_GAIN_PCT","PHASE6B_WINNER_RATIO","PHASE6B_WINNER_ALIAS","CONFIRM_SHORT","CONFIRM_LONG","CACHED_GATE","ROLLBACK_GATE","PRODUCTION_PROMOTED","FINISHED"))
+    show_summary("mtp-turn-reuse", pturn, pturnd, ("MTP_TURN_REUSE","WINNER_ALIAS","SLOT","RESULT","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("mtp-parallel", ppar, ppard, ("MTP_PARALLEL_ISOLATION","WINNER_ALIAS","UPSTREAM_SLOTS","MODE","RESULT","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("openclaw", poc, pocd, ("OPENCLAW_REGRESSION","WINNER_ALIAS","PROVIDER_MODEL","RESULT","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("promotion-review", prev, prevd, ("PROMOTION_REVIEW","WINNER_ALIAS","CONFIG_SHA256","REVIEW_DIR","PRODUCTION_PROMOTED","FINISHED"))
@@ -170,7 +186,12 @@ def main():
     warnings = []
     if PROD not in aliases:
         warnings.append("production alias is missing")
-    for name, d in (("phase1",p1d),("phase2",p2d),("phase3",p3d),("phase4",p4d),("phase4b",p4bd),("phase5",p5d),("phase6",p6d),("phase6b",p6bd),("mtp-parallel",ppard),("openclaw",pocd),("promotion-review",prevd)):
+    for name, d in (
+        ("phase1", p1d), ("phase2", p2d), ("phase3", p3d), ("phase4", p4d),
+        ("phase4b", p4bd), ("phase5", p5d), ("phase6", p6d), ("phase6b", p6bd),
+        ("mtp-turn-reuse", pturnd), ("mtp-parallel", ppard),
+        ("openclaw", pocd), ("promotion-review", prevd),
+    ):
         if d.get("PRODUCTION_PROMOTED") not in (None, "NO"):
             warnings.append(f"{name} says PRODUCTION_PROMOTED={d.get('PRODUCTION_PROMOTED')}")
     if warnings:
@@ -221,18 +242,21 @@ def main():
     elif p6d.get("PHASE6_WINNER_MODE") == "TENSOR_1x1" and (not p6b_current or not p6bd.get("PHASE6B_WINNER_ALIAS")):
         nxt = "bash flashnext-r2/scripts/run_phase6b_verified.sh"
         why = "Tensor 1:1 won, but the current bidirectional Phase-6b result is absent or older than Phase-6."
+    elif not turn_pass:
+        nxt = "python3 flashnext-r2/scripts/run_mtp_turn_reuse_gate.py"
+        why = f"winner {final_winner or 'UNKNOWN'} has not proved generated-assistant-turn cache reuse under draft-MTP (upstream issue #28049)."
     elif not parallel_pass:
         nxt = "python3 flashnext-r2/scripts/run_mtp_parallel_isolation.py"
-        why = f"winner {final_winner or 'UNKNOWN'} has not passed the current draft-MTP multi-slot isolation gate (upstream issue #28286)."
+        why = f"winner {final_winner or 'UNKNOWN'} passed turn reuse but not the current draft-MTP multi-slot isolation gate (upstream issue #28286)."
     elif not openclaw_current or pocd.get("OPENCLAW_REGRESSION") != "PASS" or pocd.get("WINNER_ALIAS") != final_winner:
         nxt = "python3 flashnext-r2/scripts/run_final_openclaw_regression.py"
-        why = f"llama-swap winner {final_winner or 'UNKNOWN'} passed slot isolation but not a matching current OpenClaw Gateway session regression."
+        why = f"llama-swap winner {final_winner or 'UNKNOWN'} passed MTP tail gates but not a matching current OpenClaw Gateway session regression."
     elif not promotion_review_current or prevd.get("PROMOTION_REVIEW") != "READY" or prevd.get("WINNER_ALIAS") != final_winner:
         nxt = "python3 flashnext-r2/scripts/prepare_promotion_review.py"
         why = "The current OpenClaw-validated winner does not yet have a matching read-only production promotion review bundle."
     else:
         nxt = f"READY_FOR_EXPLICIT_PROMOTION winner={final_winner or 'UNKNOWN'} review={prevd.get('REVIEW_DIR','UNKNOWN')}"
-        why = "All R2 performance/correctness, multi-slot isolation, OpenClaw and review gates passed. Production remains unchanged until an explicit promotion action."
+        why = "All R2 performance/correctness, generated-turn reuse, multi-slot isolation, OpenClaw and review gates passed. Production remains unchanged until an explicit promotion action."
 
     print("\nDECISION")
     print(f"WHY={why}")
