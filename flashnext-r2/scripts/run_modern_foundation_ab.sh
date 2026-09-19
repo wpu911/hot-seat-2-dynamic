@@ -3,7 +3,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROD="${PROD:-qwen3.8-flash-next:256k}"
 FOUNDATION="${FOUNDATION:-qwen3.8-flash-next-r2-modern-foundation:256k}"
+FOUNDATION_RUNTIME="${FOUNDATION_RUNTIME:-/app/share/llm/Qwen3.8-Flash-Next-GGUF/runtime-text/r2-modern-foundation}"
 OUT="${OUT:-/app/share/openclaw_tools/logs/flashnext-r2-modern-foundation-ab.json}"
+
+# A copied CMake build/bin is not an isolated runtime if its ELF still points at
+# the disposable build tree. Normalize only the experimental bundle, then hard
+# audit local dependencies and both ROCm devices before spending time on A/B.
+bash "$SCRIPT_DIR/normalize_runtime_rpath.sh" "$FOUNDATION_RUNTIME"
+REQUIRE_BOTH_GPUS=1 bash "$SCRIPT_DIR/verify_runtime_bundle.sh" "$FOUNDATION_RUNTIME"
 
 python3 "$SCRIPT_DIR/bench_llamaswap_ab.py" \
   --baseline "$PROD" --r2 "$FOUNDATION" \
