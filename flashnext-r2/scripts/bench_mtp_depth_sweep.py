@@ -10,6 +10,11 @@ real production path and benchmark semantics while using mirrored 4-arm cycles:
 for the default two cycles. Every measured leg gets a fresh model load, one
 unmeasured warm-up, fixed-length TG with ignore_eos=true, and model-specific
 unload only. Unrelated llama-swap models are never globally unloaded.
+
+TG output is tokenized after each measured completion. The analyzer compares a
+protected token prefix rather than demanding whole-512-token string identity,
+which catches speculative correctness failures without treating a late backend
+floating-point tie as if the model had changed species.
 """
 from __future__ import annotations
 
@@ -21,6 +26,7 @@ import time
 from bench_llamaswap_ab import (
     URL,
     SCHEMA_VERSION,
+    http_json,
     unload_model,
     run_leg,
     summarize,
@@ -41,6 +47,21 @@ def build_sequence(models: list[str], cycles: int) -> list[str]:
     for i in range(cycles):
         seq.extend(models if i % 2 == 0 else list(reversed(models)))
     return seq
+
+
+def add_output_tokens(base_url: str, model: str, leg: dict) -> None:
+    for row in leg.get("tg", []):
+        content = row.get("content", "")
+        tok = http_json(
+            "POST",
+            base_url + "/tokenize",
+            {"model": model, "content": content},
+            timeout=600,
+        )
+        ids = tok.get("tokens") if isinstance(tok, dict) else None
+        if not isinstance(ids, list) or not all(isinstance(x, int) for x in ids):
+            raise RuntimeError(f"{model}: /tokenize did not return output token ids")
+        row["output_tokens"] = ids
 
 
 def main():
@@ -76,6 +97,7 @@ def main():
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "fixed_tg": True,
         "requested_tg": args.tg,
+        "output_tokens_recorded": True,
         "warmup": {"pp": args.warmup_pp, "tg": args.warmup_tg},
         "legs": [],
     }
@@ -106,6 +128,7 @@ def main():
                 args.warmup_pp,
                 args.warmup_tg,
             )
+            add_output_tokens(args.url, model, leg)
             result["legs"].append(leg)
             print(json.dumps(summarize(leg), ensure_ascii=False, indent=2), flush=True)
             previous = model
