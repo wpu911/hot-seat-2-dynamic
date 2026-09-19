@@ -8,15 +8,15 @@ actually uses:
   OpenClaw Gateway :18789 -> main agent -> x-openclaw-model override
       -> local-llm provider -> llama-swap :8090 -> R2 alias
 
-The script does not edit OpenClaw config and does not promote production. It
-uses a unique OpenAI `user` value so two HTTP Chat Completions calls share one
-fresh OpenClaw session, verifies marker recall across the second turn, and checks
-llama-swap telemetry after each turn for the requested experimental alias.
+The script does not edit OpenClaw config and does not promote production. Before
+turn 1 it safely unloads only the winning experimental alias (and refuses if it
+is busy), verifies it is absent from /running, then requires OpenClaw to make it
+appear. This prevents a stale already-loaded process from masquerading as proof
+that x-openclaw-model routed correctly.
 
-Secrets are never written to the result JSON. Authentication is resolved from
-OPENCLAW_GATEWAY_TOKEN / OPENCLAW_GATEWAY_PASSWORD first, then from literal
-`gateway.auth.token` / `gateway.auth.password` in openclaw.json. Environment
-references of the form ${NAME} are resolved without logging their values.
+A unique OpenAI `user` value makes the first two Chat Completions calls share one
+fresh OpenClaw session. Marker recall validates continuation through the normal
+session path. Secrets and full prompts/responses are never written to results.
 """
 from __future__ import annotations
 
@@ -31,6 +31,8 @@ import secrets
 import time
 import urllib.error
 import urllib.request
+
+from bench_llamaswap_ab import unload_model
 
 GATEWAY = "http://127.0.0.1:18789"
 SWAP = "http://127.0.0.1:8090"
@@ -60,12 +62,7 @@ def read_env(path: Path | None) -> dict[str, str]:
 
 
 def resolve_winner(log_dir: Path) -> tuple[str, str]:
-    """Resolve the winner without letting an old Phase-6b outrank a newer Phase-6.
-
-    Re-running Phase-5 after Phase-6 also invalidates the latter. In that case we
-    stop rather than testing a stale descendant and producing a very official
-    looking JSON file about the wrong binary.
-    """
+    """Resolve current winner while rejecting stale downstream summaries."""
     p5 = latest(str(log_dir / "flashnext-r2-phase5-gdn-*/summary.env"))
     p6 = latest(str(log_dir / "flashnext-r2-phase6-tensor-split-*/summary.env"))
     p6b = latest(str(log_dir / "flashnext-r2-phase6b-ratio-*/summary.env"))
@@ -111,7 +108,7 @@ def load_openclaw_config(config_path: Path) -> dict:
     except json.JSONDecodeError as e:
         raise RuntimeError(
             f"OpenClaw config is not strict JSON at {config_path}: {e}. "
-            "Use OPENCLAW_GATEWAY_TOKEN/PASSWORD or export a strict JSON config for this regression; the script will not rewrite config."
+            "The regression script will not rewrite config to make parsing convenient."
         ) from e
 
 
@@ -197,15 +194,22 @@ def llama_swap_has_model(models_obj, alias: str) -> bool:
     return any(isinstance(x, dict) and x.get("id") == alias for x in data)
 
 
-def telemetry_contains(swap: str, alias: str) -> tuple[bool, dict]:
+def swap_snapshot(swap: str, alias: str) -> tuple[bool, dict]:
     snap = {}
-    for name, path in (("running", "/running"), ("performance", "/api/performance")):
-        try:
-            snap[name] = http_json("GET", swap + path, timeout=30)
-        except Exception as e:
-            snap[name] = {"unavailable": str(e)}
-    blob = json.dumps(snap, ensure_ascii=False)
-    return alias in blob, snap
+    try:
+        snap["running"] = http_json("GET", swap + "/running", timeout=30)
+    except Exception as e:
+        snap["running"] = {"unavailable": str(e)}
+    try:
+        snap["performance"] = http_json("GET", swap + "/api/performance", timeout=30)
+    except Exception as e:
+        snap["performance"] = {"unavailable": str(e)}
+
+    # Route proof is intentionally based on /running only. /api/performance may
+    # contain historical/configured model names and therefore is telemetry, not
+    # proof that this OpenClaw request launched the candidate.
+    running_blob = json.dumps(snap["running"], ensure_ascii=False)
+    return alias in running_blob, snap
 
 
 def unique_stress(marker: str, blocks: int) -> str:
@@ -264,6 +268,14 @@ def main():
     if not isinstance(gateway_models, dict):
         raise SystemExit("ERROR OpenClaw /v1/models returned a non-JSON object")
 
+    # Cold-route precondition. unload_model performs the same slot/busy guard as
+    # the llama-swap A/B suite and touches only this experimental alias.
+    unload_model(args.swap, winner, False)
+    time.sleep(2)
+    pre_running = http_json("GET", args.swap + "/running", timeout=30)
+    if winner in json.dumps(pre_running, ensure_ascii=False):
+        raise SystemExit(f"ERROR winner is still running after model-specific unload: {winner}")
+
     marker = "R2OC_" + secrets.token_hex(8).upper()
     user_key = "flashnext-r2-regression-" + secrets.token_hex(8)
     agent_model = f"openclaw/{args.agent}"
@@ -281,7 +293,7 @@ def main():
     t1 = time.time() - t0
     text1 = response_text(r1)
     marker_first = marker in text1
-    routed1, telem1 = telemetry_contains(args.swap, winner)
+    routed1, telem1 = swap_snapshot(args.swap, winner)
 
     req2 = {
         "model": agent_model,
@@ -294,7 +306,7 @@ def main():
     t2 = time.time() - t0
     text2 = response_text(r2)
     marker_recall = marker in text2
-    routed2, telem2 = telemetry_contains(args.swap, winner)
+    routed2, telem2 = swap_snapshot(args.swap, winner)
 
     user_key2 = "flashnext-r2-structured-" + secrets.token_hex(8)
     req3 = {
@@ -311,23 +323,24 @@ def main():
     t3 = time.time() - t0
     text3 = response_text(r3)
     structured_ok = '"status"' in text3 and '"ok"' in text3 and '40' in text3
-    routed3, telem3 = telemetry_contains(args.swap, winner)
+    routed3, telem3 = swap_snapshot(args.swap, winner)
 
     checks = {
         "gateway_models_ok": True,
         "winner_advertised_by_llamaswap": True,
+        "winner_cold_before_openclaw": True,
         "first_turn_marker": marker_first,
         "same_session_marker_recall": marker_recall,
         "structured_output": structured_ok,
-        "winner_seen_in_swap_telemetry_after_turn1": routed1,
-        "winner_seen_in_swap_telemetry_after_turn2": routed2,
-        "winner_seen_in_swap_telemetry_after_turn3": routed3,
+        "winner_running_after_turn1": routed1,
+        "winner_running_after_turn2": routed2,
+        "winner_running_after_turn3": routed3,
     }
     verdict = "PASS" if all(checks.values()) else "FAIL"
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = Path(args.out or (log_dir / f"flashnext-r2-final-openclaw-{stamp}.json"))
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "winner_alias": winner,
         "winner_source": winner_source,
@@ -337,6 +350,7 @@ def main():
         "llama_swap": args.swap,
         "auth_mode": auth_mode,
         "stress_blocks": args.stress_blocks,
+        "pre_running_sha256": hashlib.sha256(json.dumps(pre_running, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
         "prompt1_sha256": hashlib.sha256(prompt1.encode("utf-8")).hexdigest(),
         "response1_sha256": hashlib.sha256(text1.encode("utf-8")).hexdigest(),
         "response2_sha256": hashlib.sha256(text2.encode("utf-8")).hexdigest(),
