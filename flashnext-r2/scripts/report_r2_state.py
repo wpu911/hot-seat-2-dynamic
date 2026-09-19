@@ -95,6 +95,7 @@ def main():
     p2 = latest(str(logs / "flashnext-r2-phase2-*/summary.env")); p2d = env_file(p2)
     p3 = latest(str(logs / "flashnext-r2-phase3-validation-*/summary.env")); p3d = env_file(p3)
     p4 = latest(str(logs / "flashnext-r2-phase4-*/summary.env")); p4d = env_file(p4)
+    p4b = latest(str(logs / "flashnext-r2-phase4b-param-validation-*/summary.env")); p4bd = env_file(p4b)
     p5 = latest(str(logs / "flashnext-r2-phase5-gdn-*/summary.env")); p5d = env_file(p5)
     p6 = latest(str(logs / "flashnext-r2-phase6-tensor-split-*/summary.env")); p6d = env_file(p6)
     p6b = latest(str(logs / "flashnext-r2-phase6b-ratio-*/summary.env")); p6bd = env_file(p6b)
@@ -114,7 +115,8 @@ def main():
     show_summary("phase1", p1, p1d, ("FOUNDATION_RESULT","MTP_RESULT","TOPK_SMOKE_RESULT","TOPK_FULL_RESULT","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase2", p2, p2d, ("TOPK_FINAL","LONG_WINNER_ALIAS","PLE_PASS","FRSPEC_PASS","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase3", p3, p3d, ("RUNTIME_BUNDLE","NATIVE_RS_ROLLBACK","SHORT_GATE","LONG_GATE","CACHED_GATE","ROLLBACK_GATE","VALIDATION","PRODUCTION_PROMOTED","FINISHED"))
-    show_summary("phase4", p4, p4d, ("MTP_THROUGHPUT_WINNER","MTP_CACHED_GATE","MTP_ACCEPTED_ALIAS","GRAPH_WINNER","PARAM_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
+    show_summary("phase4", p4, p4d, ("MTP_RAW_BEST","MTP_THROUGHPUT_WINNER","MTP_CACHED_GATE","MTP_ACCEPTED_ALIAS","GRAPH_WINNER","PARAM_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
+    show_summary("phase4b", p4b, p4bd, ("PARAM_ALIAS","LONG_GATE","CACHED_GATE","ROLLBACK_GATE","PARAM_ACCEPTED","FALLBACK_REASON","PHASE4B_WINNER_ALIAS","VALIDATION","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase5", p5, p5d, ("THROUGHPUT_MODE","CACHED_GATE","ROLLBACK_GATE","PHASE5_WINNER_MODE","PHASE5_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase6", p6, p6d, ("SHORT_GATE_RC","LONG_GATE_RC","CACHED_GATE","ROLLBACK_GATE","PHASE6_WINNER_MODE","PHASE6_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase6b", p6b, p6bd, ("PHASE6B_WINNER_RATIO","PHASE6B_WINNER_ALIAS","CONFIRM_SHORT","CONFIRM_LONG","CACHED_GATE","ROLLBACK_GATE","PRODUCTION_PROMOTED","FINISHED"))
@@ -122,7 +124,7 @@ def main():
     warnings = []
     if PROD not in aliases:
         warnings.append("production alias is missing")
-    for name, d in (("phase1",p1d),("phase2",p2d),("phase3",p3d),("phase4",p4d),("phase5",p5d),("phase6",p6d),("phase6b",p6bd)):
+    for name, d in (("phase1",p1d),("phase2",p2d),("phase3",p3d),("phase4",p4d),("phase4b",p4bd),("phase5",p5d),("phase6",p6d),("phase6b",p6bd)):
         if d.get("PRODUCTION_PROMOTED") not in (None, "NO"):
             warnings.append(f"{name} says PRODUCTION_PROMOTED={d.get('PRODUCTION_PROMOTED')}")
     if warnings:
@@ -154,10 +156,13 @@ def main():
         why = "Final pre-sweep candidate has not passed all Phase-3 hard gates."
     elif not p4d.get("PARAM_WINNER_ALIAS"):
         nxt = "bash flashnext-r2/scripts/run_phase4_mtp_graph_sweep.sh"
-        why = "Phase-3 passed; MTP-depth/HIP-Graph sweep is incomplete."
+        why = "Phase-3 passed; balanced MTP-depth/HIP-Graph sweep is incomplete."
+    elif p4bd.get("VALIDATION") != "PASS" or not p4bd.get("PHASE4B_WINNER_ALIAS"):
+        nxt = "bash flashnext-r2/scripts/run_phase4b_param_validation.sh"
+        why = "Phase-4 chose parameters, but their 32K/64K/128K + cached + rollback validation is incomplete."
     elif not p5d.get("PHASE5_WINNER_ALIAS"):
-        nxt = "bash flashnext-r2/scripts/prepare_phase5_gdn_microfusion.sh && bash flashnext-r2/scripts/run_phase5_verified.sh"
-        why = "Phase-4 winner exists; GDN microfusion decision is incomplete."
+        nxt = "bash flashnext-r2/scripts/prepare_phase5_from_phase4b.sh && bash flashnext-r2/scripts/run_phase5_verified.sh"
+        why = "A deep-validated Phase-4b winner exists; GDN microfusion decision is incomplete."
     elif not phase6_manifest.is_file() or LAYER not in aliases or TENSOR not in aliases:
         nxt = "bash flashnext-r2/scripts/prepare_phase6_tensor_split.sh"
         why = "Phase-5 winner exists; layer-vs-tensor candidate has not been prepared."
