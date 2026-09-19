@@ -28,10 +28,12 @@ mods = [
     'bench_tensor_ratio_sweep',
     'analyze_tensor_ratio_sweep',
     'lock_r2_environment',
+    'run_mtp_turn_reuse_gate',
     'run_mtp_parallel_isolation',
     'run_final_openclaw_regression',
     'prepare_promotion_review',
     'report_r2_state',
+    'report_r2_state_plus',
 ]
 for name in mods:
     __import__(name)
@@ -56,6 +58,7 @@ checks = {
     'bench_tensor_ratio_sweep.py': '127.0.0.1:8090',
     'bench_stage10_cached_largepp.py': '127.0.0.1:8090',
     'bench_stage8_rollback_stress.py': '127.0.0.1:8090',
+    'run_mtp_turn_reuse_gate.py': '127.0.0.1:8090',
     'run_mtp_parallel_isolation.py': '127.0.0.1:8090',
     'run_final_openclaw_regression.py': '127.0.0.1:18789',
 }
