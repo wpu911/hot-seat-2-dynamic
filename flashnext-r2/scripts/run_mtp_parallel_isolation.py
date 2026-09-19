@@ -10,11 +10,11 @@ selected R2 winner, reads the upstream /slots endpoint, and:
 
 * if the server exposes one slot, records SERIALIZED_SAFE and exits 0;
 * if it exposes multiple slots, fires distinct high-entropy requests at exactly
-  that concurrency and checks every response for foreign canaries/domain tokens;
+  that concurrency and checks every response for foreign canaries/signatures;
 * requires MTP draft/accept counters on every measured response;
 * never globally unloads llama-swap and never edits production config.
 
-A detected foreign canary is a hard failure. Do not "average it out". Humans
+A detected foreign signature is a hard failure. Do not "average it out". Humans
 already invented enough ways to launder correctness bugs into benchmark wins.
 """
 from __future__ import annotations
@@ -25,7 +25,6 @@ import hashlib
 import json
 from pathlib import Path
 import random
-import re
 import time
 import urllib.parse
 
@@ -40,7 +39,6 @@ def model_id(model: str) -> str:
 
 
 def load_and_slots(base_url: str, model: str) -> list[dict]:
-    # A tiny fixed request forces llama-swap to start exactly this alias.
     payload = {
         "model": model,
         "prompt": "MTP parallel isolation preflight. Reply OK.",
@@ -63,47 +61,50 @@ def load_and_slots(base_url: str, model: str) -> list[dict]:
 
 
 def make_cases(round_idx: int, n: int) -> list[dict]:
+    # The signatures are deliberately nonsense identifiers rather than ordinary
+    # vocabulary such as "partition" or "snapshot". Ordinary words overlap
+    # across technical domains and would manufacture false contamination.
     domains = [
-        ("sorting", ["pivot", "partition", "recursion", "stable-order"],
+        ("sorting", ["SIG_SORT_Z9K2", "SIG_SORT_P4M7", "SIG_SORT_V8Q1", "SIG_SORT_H3D6"],
          "Explain a production sorting routine that partitions records around a pivot, discusses recursion depth, and contrasts stable and unstable ordering."),
-        ("roman", ["consul", "senate", "legion", "aqueduct"],
+        ("roman", ["SIG_ROMA_L7X2", "SIG_ROMA_C5N8", "SIG_ROMA_A3J4", "SIG_ROMA_T9R6"],
          "Write a compact historical analysis of late-Republic Roman institutions, military command, public works, and the political role of the senate."),
-        ("distributed", ["quorum", "replica", "partition-tolerance", "consensus"],
+        ("distributed", ["SIG_DIST_Q8W3", "SIG_DIST_F2K9", "SIG_DIST_M6P1", "SIG_DIST_B4Y7"],
          "Explain quorum reads and writes, replica divergence, network partitions, and why consensus protocols separate safety from liveness."),
-        ("biology", ["ribosome", "transcription", "mitochondria", "enzyme"],
+        ("biology", ["SIG_BIO_G5R2", "SIG_BIO_N9C4", "SIG_BIO_U3T8", "SIG_BIO_E7L1"],
          "Explain gene expression, protein synthesis, cellular energy production, and enzyme specificity to an advanced biology student."),
-        ("finance", ["duration", "convexity", "yield-curve", "coupon"],
+        ("finance", ["SIG_FIN_D6V2", "SIG_FIN_C8H5", "SIG_FIN_Y3M9", "SIG_FIN_K7Q1"],
          "Explain bond duration and convexity, yield-curve shifts, coupon effects, and why price sensitivity is nonlinear."),
-        ("database", ["wal", "mvcc", "snapshot", "vacuum"],
+        ("database", ["SIG_DB_W4P8", "SIG_DB_M2R7", "SIG_DB_S9F3", "SIG_DB_V6N1"],
          "Explain write-ahead logging, MVCC snapshots, garbage collection/vacuum, and transaction visibility in a relational database."),
-        ("compiler", ["ssa", "dominator", "register-allocation", "inlining"],
+        ("compiler", ["SIG_CC_S7A2", "SIG_CC_D4K8", "SIG_CC_R9V3", "SIG_CC_I5M1"],
          "Explain SSA form, dominator trees, register allocation, and the tradeoffs of aggressive function inlining."),
-        ("navigation", ["imu", "kalman", "drift", "gnss"],
+        ("navigation", ["SIG_NAV_I8C2", "SIG_NAV_K3R7", "SIG_NAV_G9M4", "SIG_NAV_D5Q1"],
          "Explain inertial navigation, IMU drift, GNSS correction, and Kalman-filter state estimation for a mobile platform."),
     ]
     out = []
     for i in range(n):
-        name, words, task = domains[i % len(domains)]
+        name, signatures, task = domains[i % len(domains)]
         rng = random.Random(9001 + round_idx * 101 + i)
         canary = f"R2ISO_R{round_idx:02d}_S{i:02d}_{rng.getrandbits(64):016X}"
-        # High-entropy notes make the prompts information-rich; #28286 explicitly
-        # reported that overly repetitive control prompts could miss the bug.
         notes = []
         for k in range(48):
             a = rng.randrange(10**6, 10**7)
             b = rng.randrange(10**6, 10**7)
             notes.append(
                 f"note{k:02d} {canary} ref={a} check={b} "
-                f"topic={words[k % len(words)]} phase={(k * 17 + i) % 97}"
+                f"signature={signatures[k % len(signatures)]} phase={(k * 17 + i) % 97}"
             )
         prompt = (
             f"You are handling an isolated request in domain {name}. Private canary: {canary}.\n"
+            f"Private signature set: {', '.join(signatures)}.\n"
             f"{task}\n"
             "Use only this request's subject matter. Produce at least 12 dense paragraphs. "
-            "Start EVERY paragraph with the private canary exactly as written. Do not invent a different canary.\n"
+            "Start EVERY paragraph with the private canary exactly as written. Across the response, "
+            "reuse all four private signature identifiers. Never invent or copy a different signature.\n"
             + "\n".join(notes)
         )
-        out.append({"slot": i, "domain": name, "canary": canary, "words": words, "prompt": prompt})
+        out.append({"slot": i, "domain": name, "canary": canary, "signatures": signatures, "prompt": prompt})
     return out
 
 
@@ -155,16 +156,14 @@ def inspect_round(cases: list[dict], rows: list[dict]) -> tuple[bool, list[dict]
         text = row.get("content", "")
         own = case["canary"]
         foreign_canaries = [c["canary"] for c in cases if c["slot"] != case["slot"] and c["canary"] in text]
-        foreign_vocab = []
-        low = text.lower()
+        foreign_signatures = []
         for other in cases:
             if other["slot"] == case["slot"]:
                 continue
-            hits = [w for w in other["words"] if w.lower() in low]
-            # Require >=2 distinctive foreign keywords so generic overlap does
-            # not become a false positive.
-            if len(hits) >= 2:
-                foreign_vocab.append({"domain": other["domain"], "hits": hits})
+            hits = [sig for sig in other["signatures"] if sig in text]
+            if hits:
+                foreign_signatures.append({"domain": other["domain"], "hits": hits})
+        own_signature_hits = [sig for sig in case["signatures"] if sig in text]
         own_count = text.count(own)
         d, a = row.get("drafted"), row.get("accepted")
         mtp = isinstance(d, (int, float)) and d > 0 and isinstance(a, (int, float))
@@ -172,16 +171,18 @@ def inspect_round(cases: list[dict], rows: list[dict]) -> tuple[bool, list[dict]
             row.get("full_generation") is True
             and mtp
             and own_count >= 1
+            and len(own_signature_hits) >= 1
             and not foreign_canaries
-            and not foreign_vocab
+            and not foreign_signatures
         )
         ok &= row_ok
         details.append({
             "slot": case["slot"],
             "domain": case["domain"],
             "own_canary_count": own_count,
+            "own_signature_hits": own_signature_hits,
             "foreign_canaries": foreign_canaries,
-            "foreign_vocab": foreign_vocab,
+            "foreign_signatures": foreign_signatures,
             "full_generation": row.get("full_generation"),
             "mtp_counters": mtp,
             "drafted": d,
@@ -220,7 +221,7 @@ def main():
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = Path(args.out or (log_dir / f"flashnext-r2-mtp-parallel-isolation-{stamp}.json"))
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "winner_alias": winner,
         "winner_source": winner_source,
@@ -255,16 +256,16 @@ def main():
                             rows.append(fut.result())
                         except Exception as e:
                             errors.append({"slot": c["slot"], "domain": c["domain"], "error": f"{type(e).__name__}: {e}"})
-                ok, details = inspect_round(cases, rows)
-                ok = ok and not errors
-                all_ok &= ok
+                round_ok, details = inspect_round(cases, rows)
+                round_ok = round_ok and not errors
+                all_ok &= round_ok
                 report["rounds"].append({
                     "round": rnd,
-                    "ok": ok,
+                    "ok": round_ok,
                     "errors": errors,
                     "details": details,
                 })
-                print(json.dumps({"round": rnd, "ok": ok, "errors": errors, "details": details}, ensure_ascii=False, indent=2), flush=True)
+                print(json.dumps({"round": rnd, "ok": round_ok, "errors": errors, "details": details}, ensure_ascii=False, indent=2), flush=True)
             report["verdict"] = "PASS" if all_ok else "FAIL"
     finally:
         try:
