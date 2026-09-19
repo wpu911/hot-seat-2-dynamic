@@ -19,7 +19,7 @@ git pull
 python3 flashnext-r2/scripts/report_r2_state.py
 ```
 
-报告会扫描 Modern Foundation、Phase-1 至 Phase-6b 的 manifest/summary、关键 llama-swap alias，并只输出一个保守的：
+报告会扫描 Modern Foundation、Phase-1 至 Phase-6b、OpenClaw final regression、promotion review 的 manifest/summary，并只输出一个保守的：
 
 ```text
 NEXT_ACTION=...
@@ -185,7 +185,73 @@ bash flashnext-r2/scripts/run_phase6b_verified.sh
 
 verified 入口会先归一 EVEN/MID/CAP 三套 staged runtime，再验证三者使用同一个 real ELF，并且实际 ratio 与 `phase6b-ratios.env` 完全一致。
 
-## 9. 当前 rollback / cached gate 的硬要求
+状态机不会让旧的 Phase-6b summary 覆盖一个更新的 Phase-6 决策。如果 Phase-6 后来重跑，旧 ratio winner 自动视为 stale，必须重新验证。终于不再发生“昨天的冠军统治今天的比赛”这种软件考古学。
+
+## 9. Final OpenClaw Gateway 回归
+
+llama-swap 层全部完成后，真实业务路径还要再过一关：
+
+```bash
+python3 flashnext-r2/scripts/run_final_openclaw_regression.py
+```
+
+它走：
+
+```text
+OpenClaw Gateway :18789
+→ openclaw/main
+→ x-openclaw-model: local-llm/<R2 winner>
+→ llama-swap :8090
+→ R2 alias
+```
+
+不改 `openclaw.json`，不切生产默认模型，不覆盖 production alias。
+
+固定检查：
+
+```text
+OpenClaw /v1/models 可用
+llama-swap /v1/models 确实有 winner
+x-openclaw-model 未被 modelPolicy.allow 拦截
+高多样性 session 第一轮能读到随机 marker
+同一个 OpenAI user 的第二轮能回忆 marker
+结构化 JSON 回复正常
+每轮后 llama-swap running/performance telemetry 能看到 winner alias
+```
+
+结果只保存响应 hash、长度、耗时和 gate，不把整段 session 正文抄进日志。认证 token/password 也不会写入结果文件。
+
+如果 Phase-5/6 后来重跑，旧 OpenClaw regression 自动失效，状态报告会要求重新跑当前 winner。
+
+## 10. Promotion review，只读，不自动上线
+
+OpenClaw 回归 PASS 后：
+
+```bash
+python3 flashnext-r2/scripts/prepare_promotion_review.py
+```
+
+它只生成审阅包：
+
+```text
+production-alias.yaml
+winner-alias.yaml
+manifest.json
+PROMOTION_REVIEW.md
+summary.env
+```
+
+记录当前正式 config SHA-256、生产 block、winner block 和各阶段 summary。**不会改配置，不会 unload 模型，不会 promote。**
+
+只有状态报告最后出现：
+
+```text
+READY_FOR_EXPLICIT_PROMOTION winner=...
+```
+
+才说明自动化测试链已经走完。真正替换 `qwen3.8-flash-next:256k` 仍是一个单独、明确的生产动作。
+
+## 11. 当前 rollback / cached gate 的硬要求
 
 最新版本统一为：
 
@@ -200,7 +266,7 @@ needle / deterministic protected prefix 必须正确
 
 因此，旧的“没有 acceptance 但 TG 看起来挺快”结果全部视为不可信。快得连推测解码有没有工作都不知道，那不叫优化，叫计时器有想法。
 
-## 10. 绝对不要自动做的事
+## 12. 绝对不要自动做的事
 
 ```text
 不要覆盖 qwen3.8-flash-next:256k
@@ -225,6 +291,6 @@ rollback
 OpenClaw 实际 session
 ```
 
-## 11. Work 最简接管指令
+## 13. Work 最简接管指令
 
-> 先更新 `flashnext-r2-20260918` 分支，然后运行 `python3 flashnext-r2/scripts/report_r2_state.py`。严格根据它输出的 `NEXT_ACTION` 从现有真实机器状态继续。所有 benchmark 统一走 llama-swap `127.0.0.1:8090`。不得自动替换生产 alias `qwen3.8-flash-next:256k`。Phase-4 后必须跑 `run_phase4b_param_validation.sh`，Phase-5 必须通过 `prepare_phase5_from_phase4b.sh` 接收验证后的 winner。Phase-5、Phase-6、Phase-6b 测速分别使用 `run_phase5_verified.sh`、`run_phase6_verified.sh`、`run_phase6b_verified.sh`。遇到 FAIL 时保留结果并退回上一安全 winner，不要为了让 gate 变绿而放宽正确性条件。
+> 先更新 `flashnext-r2-20260918` 分支，然后运行 `python3 flashnext-r2/scripts/report_r2_state.py`。严格根据它输出的 `NEXT_ACTION` 从现有真实机器状态继续。所有 benchmark 统一走 llama-swap `127.0.0.1:8090`。不得自动替换生产 alias `qwen3.8-flash-next:256k`。Phase-4 后必须跑 `run_phase4b_param_validation.sh`，Phase-5 必须通过 `prepare_phase5_from_phase4b.sh` 接收验证后的 winner。Phase-5、Phase-6、Phase-6b 测速分别使用 `run_phase5_verified.sh`、`run_phase6_verified.sh`、`run_phase6b_verified.sh`。最终还必须通过 `run_final_openclaw_regression.py` 和只读 `prepare_promotion_review.py`。遇到 FAIL 时保留结果并退回上一安全 winner，不要为了让 gate 变绿而放宽正确性条件。
