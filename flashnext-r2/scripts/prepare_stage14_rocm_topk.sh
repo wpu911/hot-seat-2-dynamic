@@ -173,8 +173,12 @@ if [[ -x "$BUILD/bin/test-backend-ops" ]]; then
   echo "TOPK_PERF_LOG=$TOPK_PERF_LOG"
 fi
 
-mkdir -p "$RUNTIME"
-cp -a "$BUILD/bin/." "$RUNTIME/"
+# Keep Stage-14 as relocatable as the rest of the corrected R2 line. A candidate
+# whose RUNPATH secretly points back into build-r2-rocm-topk is not a runtime,
+# it is a future incident report wearing a benchmark badge.
+REQUIRE_BOTH_GPUS="${REQUIRE_BOTH_GPUS:-1}" \
+  bash "$SCRIPT_DIR/stage_runtime_bundle.sh" \
+    "$BUILD/bin" "$RUNTIME" "$R2_SRC/r2-meta/runtime-bundle"
 sha256sum "$RUNTIME/llama-server" | tee r2-meta/stage14-llama-server.sha256
 "$RUNTIME/llama-server" --version | tee r2-meta/stage14-version.txt || true
 
