@@ -8,8 +8,9 @@ set -euo pipefail
 #   - PR #29030 PLE direct-read, only if Phase-2 recorded PLE_PASS=1
 #   - FR-Spec qwen4exp port + winning trimmed draft, only if FRSPEC_PASS=1
 #
-# Parameter tuning (MTP depth/JMAX/graphs/RDNA4 kernels) deliberately happens
-# after this composition, not during it.
+# Remaining parameter tuning (MTP depth/JMAX/graphs) happens after this
+# composition. Long-context kernel winners such as ROCm TOP_K, RDNA4 FA256,
+# QSA gather and pooled cache are already part of the recorded long winner.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${CONFIG:-/app/share/llama_box/config/config-rocm714.yaml}"
@@ -222,10 +223,17 @@ if [[ -x "$BUILD/bin/test-backend-ops" ]]; then
   "$BUILD/bin/test-backend-ops" test -o TOP_K -b ROCm0 \
     || "$BUILD/bin/test-backend-ops" test -o TOP_K -b HIP0 \
     || "$BUILD/bin/test-backend-ops" test -o TOP_K
+  if grep -Rq 'GGML_RDNA4_FA256_MMA' "$FINAL_SRC/ggml/src/ggml-cuda"; then
+    "$BUILD/bin/test-backend-ops" test -o FLASH_ATTN_EXT
+  fi
 fi
 
-mkdir -p "$FINAL_RUNTIME"
-cp -a "$BUILD/bin/." "$FINAL_RUNTIME/"
+# Stage before adding an optional launcher wrapper so the real ELF and all local
+# libllama/libggml dependencies are normalized and verified independently from
+# the temporary CMake tree.
+REQUIRE_BOTH_GPUS="${REQUIRE_BOTH_GPUS:-1}" \
+  bash "$SCRIPT_DIR/stage_runtime_bundle.sh" \
+    "$BUILD/bin" "$FINAL_RUNTIME" "$META_DIR/runtime-bundle"
 
 # When PLE direct-read won, force the validated mode with a wrapper so a stale
 # inherited --lazy-mode cannot silently change the final candidate.
@@ -246,6 +254,9 @@ done
 exec "$SELF_DIR/llama-server.real" --lazy-mode on-direct "${out[@]}"
 EOF
   chmod +x "$FINAL_RUNTIME/llama-server"
+
+  OUT="$META_DIR/runtime-bundle/runtime-verify-post-wrapper.txt" REQUIRE_BOTH_GPUS="${REQUIRE_BOTH_GPUS:-1}" \
+    bash "$SCRIPT_DIR/verify_runtime_bundle.sh" "$FINAL_RUNTIME"
 fi
 
 REAL_BIN="$FINAL_RUNTIME/llama-server"
