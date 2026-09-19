@@ -108,11 +108,14 @@ def main():
     p6 = latest(str(logs / "flashnext-r2-phase6-tensor-split-*/summary.env")); p6d = env_file(p6)
     p6b = latest(str(logs / "flashnext-r2-phase6b-ratio-*/summary.env")); p6bd = env_file(p6b)
     poc = latest(str(logs / "flashnext-r2-final-openclaw-*/summary.env")); pocd = env_file(poc)
+    prev = latest(str(logs / "flashnext-r2-promotion-review-*/summary.env")); prevd = env_file(prev)
 
     p6b_current = p6d.get("PHASE6_WINNER_MODE") == "TENSOR_1x1" and newer_or_equal(p6b, p6)
     effective_p6bd = p6bd if p6b_current else {}
     final_winner = effective_p6bd.get("PHASE6B_WINNER_ALIAS") or p6d.get("PHASE6_WINNER_ALIAS") or p5d.get("PHASE5_WINNER_ALIAS")
-    openclaw_current = newer_or_equal(poc, p6b if p6b_current else (p6 or p5))
+    winner_parent = p6b if p6b_current else (p6 or p5)
+    openclaw_current = newer_or_equal(poc, winner_parent)
+    promotion_review_current = newer_or_equal(prev, poc)
 
     print("=== Flash Next R2 state report ===")
     print(f"config_exists={config.is_file()}")
@@ -137,11 +140,12 @@ def main():
     show_summary("phase6", p6, p6d, ("SHORT_GATE_RC","LONG_GATE_RC","CACHED_GATE","ROLLBACK_GATE","PHASE6_WINNER_MODE","PHASE6_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase6b", p6b, p6bd, ("PHASE6B_WINNER_RATIO","PHASE6B_WINNER_ALIAS","CONFIRM_SHORT","CONFIRM_LONG","CACHED_GATE","ROLLBACK_GATE","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("openclaw", poc, pocd, ("OPENCLAW_REGRESSION","WINNER_ALIAS","PROVIDER_MODEL","RESULT","PRODUCTION_PROMOTED","FINISHED"))
+    show_summary("promotion-review", prev, prevd, ("PROMOTION_REVIEW","WINNER_ALIAS","CONFIG_SHA256","REVIEW_DIR","PRODUCTION_PROMOTED","FINISHED"))
 
     warnings = []
     if PROD not in aliases:
         warnings.append("production alias is missing")
-    for name, d in (("phase1",p1d),("phase2",p2d),("phase3",p3d),("phase4",p4d),("phase4b",p4bd),("phase5",p5d),("phase6",p6d),("phase6b",p6bd),("openclaw",pocd)):
+    for name, d in (("phase1",p1d),("phase2",p2d),("phase3",p3d),("phase4",p4d),("phase4b",p4bd),("phase5",p5d),("phase6",p6d),("phase6b",p6bd),("openclaw",pocd),("promotion-review",prevd)):
         if d.get("PRODUCTION_PROMOTED") not in (None, "NO"):
             warnings.append(f"{name} says PRODUCTION_PROMOTED={d.get('PRODUCTION_PROMOTED')}")
     if warnings:
@@ -195,9 +199,12 @@ def main():
     elif not openclaw_current or pocd.get("OPENCLAW_REGRESSION") != "PASS" or pocd.get("WINNER_ALIAS") != final_winner:
         nxt = "python3 flashnext-r2/scripts/run_final_openclaw_regression.py"
         why = f"llama-swap winner {final_winner or 'UNKNOWN'} has not passed a matching current OpenClaw Gateway session regression."
+    elif not promotion_review_current or prevd.get("PROMOTION_REVIEW") != "READY" or prevd.get("WINNER_ALIAS") != final_winner:
+        nxt = "python3 flashnext-r2/scripts/prepare_promotion_review.py"
+        why = "The current OpenClaw-validated winner does not yet have a matching read-only production promotion review bundle."
     else:
-        nxt = f"READY_FOR_PROMOTION_REVIEW winner={final_winner or 'UNKNOWN'}"
-        why = "All R2 performance/correctness gates and the matching OpenClaw Gateway regression passed. Promotion is still a separate explicit operation."
+        nxt = f"READY_FOR_EXPLICIT_PROMOTION winner={final_winner or 'UNKNOWN'} review={prevd.get('REVIEW_DIR','UNKNOWN')}"
+        why = "All automated R2 gates passed and a current immutable promotion review was generated. Production remains unchanged until an explicit promotion action."
 
     print("\nDECISION")
     print(f"WHY={why}")
