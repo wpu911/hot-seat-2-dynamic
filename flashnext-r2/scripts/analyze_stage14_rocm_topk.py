@@ -5,16 +5,13 @@ Two independent llama-swap ladders are expected:
   1. graphs ON  : modern-MTP base vs ROCm TOP_K candidate
   2. graphs OFF : same two engines with GGML_CUDA_DISABLE_GRAPHS=1
 
-Why both? PR #28313 was benchmarked upstream with HIP graphs disabled because of
-an upstream ROCm graph-update problem. A useful TOP_K kernel should not be thrown
-away merely because graph capture masks its benefit on this machine; conversely,
-we must not promote a kernel that is only fast in a synthetic graph-off setup if
-normal production remains slower.
-
 Verdicts:
-  PASS                 normal graph-on production path wins and correctness holds
+  PASS                  normal graph-on production path wins and correctness holds
   HIP_GRAPH_INTERACTION graph-off wins materially but graph-on does not
-  FAIL                 no material end-to-end win or correctness regression
+  FAIL                  no material safe end-to-end win
+
+Current Stage-14 data must come from the fixed-length schema-3 ladder. Missing
+MTP acceptance, short generation, or needle failure is a hard correctness failure.
 """
 from __future__ import annotations
 
@@ -35,8 +32,19 @@ def pct(new, old):
     return (new / old - 1.0) * 100.0
 
 
+def schema_ok(data):
+    return (
+        isinstance(data.get("schema_version"), int)
+        and data.get("schema_version") >= 3
+        and data.get("ignore_eos") is True
+        and isinstance(data.get("requested_predict"), (int, float))
+        and data.get("requested_predict") > 0
+    )
+
+
 def collect(data, model):
     rows = {}
+    requested = data.get("requested_predict")
     for leg in data.get("legs", []):
         if leg.get("model") != model:
             continue
@@ -51,13 +59,21 @@ def collect(data, model):
             dn, an = x.get("drafted"), x.get("accepted")
             if isinstance(dn, (int, float)) and dn > 0 and isinstance(an, (int, float)):
                 acc.append(an / dn)
+        full = bool(rr) and all(x.get("full_generation") is True for x in rr)
+        if isinstance(requested, (int, float)):
+            full = full and all(
+                isinstance(x.get("predicted_n"), (int, float)) and x.get("predicted_n") >= requested
+                for x in rr
+            )
         out[d] = {
             "samples": len(rr),
             "prompt_n": med([x.get("prompt_n") for x in rr]),
             "pp": med([x.get("pp") for x in rr]),
             "tg": med([x.get("tg") for x in rr]),
             "acceptance": med(acc),
+            "acceptance_samples": len(acc),
             "marker_ok": all(bool(x.get("marker_hit")) for x in rr),
+            "full_generation": full,
         }
     return out
 
@@ -71,6 +87,9 @@ def compare(data, baseline, candidate, deep_from):
     deep_acc_pp = []
     pp_all = []
     marker_ok = bool(depths)
+    full_ok = bool(depths)
+    acceptance_ok = bool(depths)
+    samples_ok = bool(depths)
 
     for d in depths:
         bd, cd = b.get(d, {}), c.get(d, {})
@@ -79,12 +98,24 @@ def compare(data, baseline, candidate, deep_from):
         ba, ca = bd.get("acceptance"), cd.get("acceptance")
         acc_pp = None if ba is None or ca is None else (ca - ba) * 100.0
         mok = bool(bd.get("marker_ok")) and bool(cd.get("marker_ok"))
+        fok = bool(bd.get("full_generation")) and bool(cd.get("full_generation"))
+        aok = (
+            isinstance(ba, (int, float)) and isinstance(ca, (int, float))
+            and bd.get("acceptance_samples", 0) == bd.get("samples", 0)
+            and cd.get("acceptance_samples", 0) == cd.get("samples", 0)
+        )
+        sok = bd.get("samples", 0) > 0 and cd.get("samples", 0) > 0
         marker_ok &= mok
+        full_ok &= fok
+        acceptance_ok &= aok
+        samples_ok &= sok
         deltas[str(d)] = {
             "tg_pct": tg,
             "pp_pct": pp,
             "acceptance_delta_pp": acc_pp,
             "marker_ok": mok,
+            "full_generation": fok,
+            "acceptance_complete": aok,
         }
         if d >= deep_from:
             if tg is not None:
@@ -101,7 +132,11 @@ def compare(data, baseline, candidate, deep_from):
         "candidate_metrics": c,
         "delta": deltas,
         "summary": {
+            "schema_ok": schema_ok(data),
+            "samples_ok": samples_ok,
             "marker_ok": marker_ok,
+            "full_generation_ok": full_ok,
+            "acceptance_complete": acceptance_ok,
             "deep_median_tg_gain_pct": med(deep_tg),
             "deep_worst_tg_delta_pct": min(deep_tg) if deep_tg else None,
             "median_pp_delta_pct": med(pp_all),
@@ -111,11 +146,6 @@ def compare(data, baseline, candidate, deep_from):
 
 
 def candidate_graph_effect(on_cmp, off_cmp):
-    """Compare candidate's own graph-ON vs graph-OFF TG by depth.
-
-    This is diagnostic only because the two JSON files are independent runs, but
-    it tells us whether HIP graph capture is plausibly hiding a TOP_K kernel win.
-    """
     on = on_cmp["candidate_metrics"]
     off = off_cmp["candidate_metrics"]
     out = {}
@@ -126,7 +156,7 @@ def candidate_graph_effect(on_cmp, off_cmp):
 
 def print_cmp(label, cmp):
     print(f"\n=== {label} ===")
-    print("depth     PP base -> cand        TG base -> cand        TG delta    acc dPP   marker")
+    print("depth     PP base -> cand        TG base -> cand        TG delta    acc dPP   marker full")
     for ds, dlt in cmp["delta"].items():
         d = int(ds)
         b = cmp["baseline_metrics"].get(d, {})
@@ -135,7 +165,7 @@ def print_cmp(label, cmp):
             f"{d:>7}  {str(b.get('pp')):>9} -> {str(c.get('pp')):<9}  "
             f"{str(b.get('tg')):>8} -> {str(c.get('tg')):<8}  "
             f"{str(dlt.get('tg_pct')):>9}  {str(dlt.get('acceptance_delta_pp')):>8}  "
-            f"{dlt.get('marker_ok')}"
+            f"{dlt.get('marker_ok')} {dlt.get('full_generation')}"
         )
     print(json.dumps(cmp["summary"], ensure_ascii=False, indent=2))
 
@@ -169,10 +199,17 @@ def main():
         s = cmp["summary"]
         acc = s["deep_worst_acceptance_delta_pp"]
         return (
-            s["marker_ok"]
-            and (s["deep_worst_tg_delta_pct"] is None or s["deep_worst_tg_delta_pct"] >= -args.max_deep_loss)
-            and (s["median_pp_delta_pct"] is None or s["median_pp_delta_pct"] >= -args.max_pp_loss)
-            and (acc is None or acc >= -args.max_acceptance_drop_pp)
+            s["schema_ok"]
+            and s["samples_ok"]
+            and s["marker_ok"]
+            and s["full_generation_ok"]
+            and s["acceptance_complete"]
+            and s["deep_worst_tg_delta_pct"] is not None
+            and s["deep_worst_tg_delta_pct"] >= -args.max_deep_loss
+            and s["median_pp_delta_pct"] is not None
+            and s["median_pp_delta_pct"] >= -args.max_pp_loss
+            and acc is not None
+            and acc >= -args.max_acceptance_drop_pp
         )
 
     on_s = on_cmp["summary"]
@@ -186,7 +223,7 @@ def main():
     if on_pass:
         verdict = "PASS"
         reason = "ROCm TOP_K improves the normal graph-ON production path."
-    elif off_pass and off_s["marker_ok"] and on_s["marker_ok"]:
+    elif off_pass and on_s["schema_ok"] and on_s["marker_ok"] and on_s["full_generation_ok"]:
         verdict = "HIP_GRAPH_INTERACTION"
         reason = (
             "ROCm TOP_K wins with HIP graphs disabled but not enough with graphs enabled; "
@@ -224,8 +261,6 @@ def main():
     out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"ANALYSIS={out}")
 
-    # HIP_GRAPH_INTERACTION is intentionally a distinct nonzero status. The
-    # runner can surface it without treating the kernel as a clean promotion.
     if verdict == "PASS":
         raise SystemExit(0)
     if verdict == "HIP_GRAPH_INTERACTION":
