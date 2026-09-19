@@ -21,11 +21,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 import platform
 import re
-import shlex
 import subprocess
 import time
 
@@ -61,8 +59,6 @@ def alias_block(config: Path, alias: str) -> str:
 
 
 def server_from_block(block: str) -> Path:
-    # llama-swap cmd blocks in this project place the executable as an absolute
-    # /.../llama-server token/line. Keep the match intentionally narrow.
     hits = re.findall(r"(?<![A-Za-z0-9_.-])(/[^\s\"']*/llama-server)(?![A-Za-z0-9_.-])", block)
     if not hits:
         raise RuntimeError("could not locate absolute llama-server path in production alias block")
@@ -155,6 +151,29 @@ def compare(expected: dict, actual: dict) -> list[dict]:
     return [{"field": k, "expected": a, "actual": b} for k, a, b in paths if a != b]
 
 
+def require_lock(
+    config: str | Path = CONFIG,
+    swap_bin: str | Path = SWAP_BIN,
+    prod_alias: str = PROD,
+    lock: str | Path = LOCK,
+) -> dict:
+    """Return the lock document or raise RuntimeError on any environment drift."""
+    config = Path(config)
+    swap_bin = Path(swap_bin)
+    lock = Path(lock)
+    if not lock.is_file():
+        raise RuntimeError(f"environment lock missing: {lock}; create it before controlled A/B")
+    try:
+        expected = json.loads(lock.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"environment lock is unreadable: {lock}: {e}") from e
+    actual = snapshot(config, swap_bin, prod_alias)
+    diffs = compare(expected, actual)
+    if diffs:
+        raise RuntimeError("R2 environment drift detected: " + json.dumps(diffs, ensure_ascii=False))
+    return expected
+
+
 def main():
     ap = argparse.ArgumentParser()
     mode = ap.add_mutually_exclusive_group(required=True)
@@ -168,10 +187,10 @@ def main():
     args = ap.parse_args()
 
     lock = Path(args.lock)
-    actual = snapshot(Path(args.config), Path(args.swap_bin), args.production_alias)
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
 
     if args.create:
+        actual = snapshot(Path(args.config), Path(args.swap_bin), args.production_alias)
         if lock.exists() and not args.replace:
             raise SystemExit(f"ERROR lock already exists: {lock}; use --check, not a convenient rewrite of history")
         actual["created"] = now
@@ -184,18 +203,19 @@ def main():
         print(f"PRODUCTION_ALIAS_BLOCK_SHA256={actual['production']['alias_block_sha256']}")
         return
 
-    if not lock.is_file():
-        raise SystemExit(f"ERROR environment lock missing: {lock}; create it before controlled A/B")
-    expected = json.loads(lock.read_text(encoding="utf-8"))
-    diffs = compare(expected, actual)
-    report = {
+    try:
+        expected = require_lock(args.config, args.swap_bin, args.production_alias, args.lock)
+    except RuntimeError as e:
+        print(f"R2_ENVIRONMENT_LOCK=FAIL\nERROR={e}")
+        raise SystemExit(2)
+    print(json.dumps({
         "checked": now,
         "lock": str(lock),
-        "result": "PASS" if not diffs else "FAIL",
-        "diffs": diffs,
-    }
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    raise SystemExit(0 if not diffs else 2)
+        "result": "PASS",
+        "llama_swap_version": expected.get("llama_swap", {}).get("version", {}).get("text"),
+        "llama_swap_sha256": expected.get("llama_swap", {}).get("sha256"),
+        "production_alias_block_sha256": expected.get("production", {}).get("alias_block_sha256"),
+    }, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
