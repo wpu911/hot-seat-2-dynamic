@@ -9,9 +9,9 @@ TG measurement is intentionally fixed-length: ignore_eos=true forces the server
 to generate n_predict tokens. Without this, the old "only output the marker"
 prompt often ended after a handful of tokens and produced a very noisy TG number.
 
-Default sequence is OFF -> ON. Use --rounds 4 for OFF/ON/OFF/ON confirmation
-once an exploratory pass looks good, because 131k prefills are not free and
-apparently electrons also have employment rights.
+Each freshly loaded alias gets one unmeasured 4K warm-up before the measured
+context ladder. This removes first-use load/graph/kernel initialization from the
+32K smoke point. Current llama-server MTP counters are read from timings first.
 """
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ URL = "http://127.0.0.1:8090"
 OFF = "qwen3.8-flash-next-r2-qsa-off:256k"
 ON = "qwen3.8-flash-next-r2-qsa-on:256k"
 MARKER = "QSA_VERIFY_20260918_7B_7F3C"
+SCHEMA_VERSION = 3
 
 
 def http_json(method: str, url: str, obj=None, timeout=7200):
@@ -130,17 +131,22 @@ def make_prompt(url: str, model: str, target: int) -> str:
     return detokenize(url, model, ids)
 
 
-def extract_counts(r: dict):
-    drafted = accepted = None
-    for k in ("drafted_n", "tokens_drafted", "n_drafted"):
-        if k in r:
-            drafted = r[k]
-            break
-    for k in ("drafted_n_accepted", "tokens_drafted_accepted", "n_drafted_accepted"):
-        if k in r:
-            accepted = r[k]
-            break
-    return drafted, accepted
+def extract_counts(r: dict, timings: dict):
+    for src in (timings, r):
+        if not isinstance(src, dict):
+            continue
+        drafted = accepted = None
+        for k in ("draft_n", "drafted_n", "tokens_drafted", "n_drafted"):
+            if k in src:
+                drafted = src[k]
+                break
+        for k in ("draft_n_accepted", "drafted_n_accepted", "tokens_drafted_accepted", "n_drafted_accepted"):
+            if k in src:
+                accepted = src[k]
+                break
+        if drafted is not None or accepted is not None:
+            return drafted, accepted
+    return None, None
 
 
 def run_one(url: str, model: str, target: int, n_predict: int):
@@ -161,7 +167,7 @@ def run_one(url: str, model: str, target: int, n_predict: int):
     if not isinstance(r, dict):
         raise RuntimeError(f"unexpected completion response: {type(r)}")
     tm = r.get("timings", {}) or {}
-    drafted, accepted = extract_counts(r)
+    drafted, accepted = extract_counts(r, tm)
     content = r.get("content", "")
     predicted_n = tm.get("predicted_n")
     full_generation = isinstance(predicted_n, (int, float)) and predicted_n >= n_predict
@@ -189,6 +195,8 @@ def main():
     ap.add_argument("--depths", default="4096,16384,32768,65536,131072")
     ap.add_argument("--tg", type=int, default=128)
     ap.add_argument("--rounds", type=int, default=2)
+    ap.add_argument("--warmup-depth", type=int, default=4096)
+    ap.add_argument("--warmup-tg", type=int, default=64)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--out", default="/app/share/openclaw_tools/logs/flashnext-r2-qsa-ladder.json")
     args = ap.parse_args()
@@ -196,12 +204,14 @@ def main():
     depths = [int(x) for x in args.depths.split(",") if x.strip()]
     seq = [args.baseline if i % 2 == 0 else args.r2 for i in range(args.rounds)]
     result = {
+        "schema_version": SCHEMA_VERSION,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "url": args.url,
         "marker": MARKER,
         "depths": depths,
         "requested_predict": args.tg,
         "ignore_eos": True,
+        "warmup": {"depth": args.warmup_depth, "tg": args.warmup_tg},
         "sequence": seq,
         "legs": [],
     }
@@ -211,7 +221,16 @@ def main():
         unload(args.url, args.baseline, args.force)
         unload(args.url, args.r2, args.force)
         time.sleep(3)
-        leg = {"model": model, "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "rows": []}
+        leg = {"model": model, "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "warmup": None, "rows": []}
+
+        print(f"warmup depth={args.warmup_depth} tg={args.warmup_tg}", flush=True)
+        warm = run_one(args.url, model, args.warmup_depth, args.warmup_tg)
+        if not warm["full_generation"] or not warm["marker_hit"]:
+            raise RuntimeError(
+                f"warmup failed for {model}: full={warm['full_generation']} marker={warm['marker_hit']}"
+            )
+        leg["warmup"] = warm
+
         for d in depths:
             print(f"depth={d}", flush=True)
             row = run_one(args.url, model, d, args.tg)
@@ -240,6 +259,8 @@ def main():
                     f"server returned only {row['predicted_n']} generated tokens at depth {d}; "
                     f"fixed-length TG requires {args.tg}. Check ignore_eos support before trusting this run."
                 )
+            if not row["marker_hit"]:
+                raise RuntimeError(f"needle retrieval failed for {model} at depth {d}")
         leg["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         leg["running_after"] = get_optional(args.url, "/running")
         result["legs"].append(leg)
