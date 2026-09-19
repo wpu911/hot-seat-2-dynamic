@@ -5,7 +5,7 @@ RUNTIME_ROOT="${RUNTIME_ROOT:-/app/share/llm/Qwen3.8-Flash-Next-GGUF/runtime-tex
 LOG_DIR="${LOG_DIR:-/app/share/openclaw_tools/logs}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
-for name in tensor-1x1 tensor-mid tensor-cap; do
+for name in tensor-1x1 tensor-mid tensor-cap tensor-inv-mid tensor-inv-cap; do
   bin="$RUNTIME_ROOT/$name/bin"
   [[ -d "$bin" ]] || { echo "ERROR Phase-6b runtime missing: $bin" >&2; exit 2; }
   OUT="$LOG_DIR/flashnext-r2-phase6b-${name}-normalize-$STAMP.log" \
