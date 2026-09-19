@@ -8,9 +8,14 @@ set -euo pipefail
 # resurrect the old manual JMAX or Q8-dedup environment experiments.
 #
 # Sweep order:
-#   1) MTP n-max 2 / 3 / 4 with all else identical
-#   2) cached Large-PP regression on the throughput winner
+#   1) balanced MTP n-max 1 / 2 / 3 / 4 with all else identical
+#   2) cached Large-PP regression on the accepted throughput winner
 #   3) HIP Graph ON / OFF with the accepted MTP winner
+#
+# n-max=1 is intentional. Newer qwen4exp MTP testing has shown that on some
+# interconnect-bound multi-GPU systems a one-deep draft can beat deeper chains,
+# while other systems prefer 3 or 4. Heterogeneous gfx1100+gfx1201 therefore has
+# to measure it instead of inheriting somebody else's sweet spot.
 #
 # No production promotion.
 
@@ -54,6 +59,15 @@ VALIDATION_SUMMARY="${VALIDATION_SUMMARY:-$(latest_validation_summary || true)}"
 }
 note "VALIDATION_SUMMARY=$VALIDATION_SUMMARY"
 
+# A Phase-3 runtime may have been created by an older Work session before the
+# runtime-isolation gate existed. Normalize only this experimental bundle and
+# audit it again before deriving four aliases from it.
+OUT="$RUN_DIR/runtime-rpath-normalize.log" \
+  bash "$SCRIPT_DIR/normalize_runtime_rpath.sh" "$FINAL_RUNTIME"
+REQUIRE_BOTH_GPUS=1 OUT="$RUN_DIR/runtime-verify.log" \
+  bash "$SCRIPT_DIR/verify_runtime_bundle.sh" "$FINAL_RUNTIME"
+note "RUNTIME_BUNDLE=PASS"
+
 # Ensure modern carry-over is understood before tuning. This prevents an old
 # experiment script from accidentally reintroducing superseded kernel patches.
 if [[ -x "$SCRIPT_DIR/verify_modern_kernel_carryover.sh" || -f "$SCRIPT_DIR/verify_modern_kernel_carryover.sh" ]]; then
@@ -61,7 +75,8 @@ if [[ -x "$SCRIPT_DIR/verify_modern_kernel_carryover.sh" || -f "$SCRIPT_DIR/veri
     bash "$SCRIPT_DIR/verify_modern_kernel_carryover.sh"
 fi
 
-# ---------------- MTP depth 2/3/4 ----------------
+# ---------------- MTP depth 1/2/3/4 ----------------
+A1="qwen3.8-flash-next-r2-final-mtp1:256k"
 A2="qwen3.8-flash-next-r2-final-mtp2:256k"
 A3="qwen3.8-flash-next-r2-final-mtp3:256k"
 A4="qwen3.8-flash-next-r2-final-mtp4:256k"
@@ -79,36 +94,53 @@ make_mtp_alias() {
   [[ "$validate" == 1 ]] && args+=(--validate)
   "${args[@]}"
 }
+make_mtp_alias "$A1" 1 0
 make_mtp_alias "$A2" 2 0
 make_mtp_alias "$A3" 3 0
 make_mtp_alias "$A4" 4 1
 
-COMMON=(--rounds "${MTP_ROUNDS:-4}" --repeat "${MTP_REPEAT:-3}" --tg "${MTP_TG:-512}" --pp "${MTP_PP:-512}")
-R23="$RUN_DIR/mtp2-vs3.json"
-R24="$RUN_DIR/mtp2-vs4.json"
-R34="$RUN_DIR/mtp3-vs4.json"
-python3 "$SCRIPT_DIR/bench_llamaswap_ab.py" --baseline "$A2" --r2 "$A3" "${COMMON[@]}" --out "$R23"
-python3 "$SCRIPT_DIR/bench_llamaswap_ab.py" --baseline "$A2" --r2 "$A4" "${COMMON[@]}" --out "$R24"
-python3 "$SCRIPT_DIR/bench_llamaswap_ab.py" --baseline "$A3" --r2 "$A4" "${COMMON[@]}" --out "$R34"
+MTP_SWEEP="$RUN_DIR/mtp-depth-1-4.json"
+python3 "$SCRIPT_DIR/bench_mtp_depth_sweep.py" \
+  --models "$A1,$A2,$A3,$A4" \
+  --cycles "${MTP_CYCLES:-2}" \
+  --repeat "${MTP_REPEAT:-3}" \
+  --tg "${MTP_TG:-512}" \
+  --pp "${MTP_PP:-512}" \
+  --out "$MTP_SWEEP"
+
 MTP_ANALYSIS="$RUN_DIR/mtp-analysis.json"
-python3 "$SCRIPT_DIR/analyze_mtp_sweep.py" "$R23" "$R24" "$R34" --out "$MTP_ANALYSIS"
+python3 "$SCRIPT_DIR/analyze_mtp_sweep.py" "$MTP_SWEEP" \
+  --anchor "$A2" \
+  --min-gain "${MTP_MIN_GAIN:-1.0}" \
+  --out "$MTP_ANALYSIS"
 
 MTP_WINNER="$(python3 - "$MTP_ANALYSIS" <<'PY'
 import json,sys
 j=json.load(open(sys.argv[1]))
-for r in j.get('ranking',[]):
-    if r.get('exact') and isinstance(r.get('median_tg'),(int,float)):
-        print(r['model']); break
-else:
-    raise SystemExit('ERROR: no exact MTP sweep winner')
+m=j.get('recommended_model')
+if not isinstance(m,str) or not m:
+    raise SystemExit('ERROR: no recommended MTP sweep model')
+print(m)
 PY
 )"
+MTP_RAW_BEST="$(python3 - "$MTP_ANALYSIS" <<'PY'
+import json,sys
+j=json.load(open(sys.argv[1]))
+for r in j.get('ranking',[]):
+    if r.get('valid') and isinstance(r.get('median_tg'),(int,float)):
+        print(r['model']); break
+else:
+    raise SystemExit('ERROR: no valid MTP sweep arm')
+PY
+)"
+note "MTP_RAW_BEST=$MTP_RAW_BEST"
 note "MTP_THROUGHPUT_WINNER=$MTP_WINNER"
+note "MTP_SWEEP_RESULT=$MTP_SWEEP"
 note "MTP_ANALYSIS=$MTP_ANALYSIS"
 
 # Speculative depth must survive cached-prefix/high-LCP behavior, not merely fresh
-# TG. If the throughput winner fails, fall back to the already Phase-3-validated
-# final alias rather than promoting a flashy fresh-prompt regression.
+# TG. If the recommended depth fails, fall back to the already Phase-3-validated
+# final alias rather than keeping a fresh-prompt benchmark trophy on the shelf.
 MTP_CACHED="$RUN_DIR/mtp-winner-cached.json"
 set +e
 python3 "$SCRIPT_DIR/bench_stage10_cached_largepp.py" \
@@ -119,6 +151,7 @@ python3 "$SCRIPT_DIR/bench_stage10_cached_largepp.py" \
   --n-predict "${CACHED_TG:-512}" \
   --repeats "${CACHED_REPEATS:-2}" \
   --max-vs-baseline-loss "${CACHED_MAX_LOSS:-5.0}" \
+  --max-acceptance-drop-pp "${CACHED_MAX_ACC_DROP_PP:-5.0}" \
   --out "$MTP_CACHED"
 MTP_CACHED_RC=$?
 set -e
@@ -179,5 +212,5 @@ echo "FLASH NEXT R2 PHASE-4 PARAMETER SWEEP COMPLETE"
 echo "================================================================"
 cat "$SUMMARY"
 echo
-echo "Manual JMAX and old Q8-dedup sweeps were intentionally skipped because Modern Foundation already contains their upstream equivalents."
+echo "MTP n-max 1/2/3/4 was measured as a balanced multi-arm sweep. Manual JMAX and old Q8-dedup sweeps remain retired because Modern Foundation already contains their upstream equivalents."
 echo "Next: validate PARAM_WINNER_ALIAS on 32K/64K/128K + cached rollback before any gfx1201-only kernel experiment."
