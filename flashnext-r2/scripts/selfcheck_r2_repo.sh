@@ -27,6 +27,7 @@ mods = [
     'analyze_mtp_sweep',
     'bench_tensor_ratio_sweep',
     'analyze_tensor_ratio_sweep',
+    'analyze_stage15_rdna4_fa256',
     'lock_r2_environment',
     'run_mtp_turn_reuse_gate',
     'run_mtp_parallel_isolation',
