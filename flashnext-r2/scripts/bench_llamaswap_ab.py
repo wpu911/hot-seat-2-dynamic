@@ -10,8 +10,9 @@ Default sequence is baseline -> R2 -> baseline -> R2. Model switches use the
 model-specific llama-swap unload endpoint, never the global unload endpoint, so
 an unrelated Ornith/Vision/etc process is not killed by the benchmark.
 
-Before unloading a Flash Next alias, /upstream/<model>/slots is checked. If a slot
-looks busy the benchmark refuses to continue unless --force is explicitly used.
+TG legs use ignore_eos=true and reject short generations. Current llama-server
+reports speculative counters inside timings as draft_n / draft_n_accepted; older
+aliases are still accepted as fallbacks for compatibility.
 """
 from __future__ import annotations
 
@@ -42,8 +43,6 @@ def http_json(method: str, url: str, obj=None, timeout=1800):
 
 
 def model_path_id(model: str) -> str:
-    # Current aliases contain ':' but no '/'. Keep ':' readable; encode everything
-    # else that could alter the management path.
     return urllib.parse.quote(model, safe=":")
 
 
@@ -70,7 +69,6 @@ def slot_is_busy(x) -> bool:
         return True
     if isinstance(state, (int, float)) and state != 0:
         return True
-    # Some llama-server builds expose slot state inside nested objects.
     for k, v in x.items():
         if k in ("params", "prompt", "generated", "timings"):
             continue
@@ -82,7 +80,6 @@ def slot_is_busy(x) -> bool:
 def ensure_not_busy(base_url: str, model: str, force: bool):
     s = slots(base_url, model)
     if isinstance(s, dict) and "unavailable" in s:
-        # Not running/not routable is harmless for unload purposes.
         return
     if slot_is_busy(s):
         if force:
@@ -100,8 +97,6 @@ def unload_model(base_url: str, model: str, force: bool = False):
     try:
         return http_json("POST", url, {}, timeout=120)
     except Exception:
-        # An already-unloaded/non-running model may be reported as an HTTP error on
-        # some builds. Check /running before deciding this is fatal.
         running = get_optional(base_url, "/running")
         blob = json.dumps(running, ensure_ascii=False)
         if model not in blob:
@@ -128,7 +123,27 @@ def exact_prompt(base_url: str, model: str, target_tokens: int) -> str:
         return text[: target_tokens * 5]
 
 
-def one_completion(base_url: str, model: str, prompt: str, n_predict: int):
+def speculative_counts(r: dict, timings: dict):
+    # Current server-common.cpp places these in timings.
+    for src in (timings, r):
+        if not isinstance(src, dict):
+            continue
+        drafted = None
+        accepted = None
+        for key in ("draft_n", "drafted_n", "tokens_drafted", "n_drafted"):
+            if key in src:
+                drafted = src[key]
+                break
+        for key in ("draft_n_accepted", "drafted_n_accepted", "tokens_drafted_accepted", "n_drafted_accepted"):
+            if key in src:
+                accepted = src[key]
+                break
+        if drafted is not None or accepted is not None:
+            return drafted, accepted
+    return None, None
+
+
+def one_completion(base_url: str, model: str, prompt: str, n_predict: int, *, fixed_length: bool):
     payload = {
         "model": model,
         "prompt": prompt,
@@ -138,30 +153,33 @@ def one_completion(base_url: str, model: str, prompt: str, n_predict: int):
         "cache_prompt": False,
         "stream": False,
     }
+    if fixed_length:
+        payload["ignore_eos"] = True
+
     t0 = time.time()
     r = http_json("POST", base_url + "/completion", payload, timeout=3600)
     wall = time.time() - t0
-    timings = r.get("timings", {}) if isinstance(r, dict) else {}
-    drafted = None
-    accepted = None
-    if isinstance(r, dict):
-        for key in ("drafted_n", "tokens_drafted", "n_drafted"):
-            if key in r:
-                drafted = r[key]
-                break
-        for key in ("drafted_n_accepted", "tokens_drafted_accepted", "n_drafted_accepted"):
-            if key in r:
-                accepted = r[key]
-                break
+    if not isinstance(r, dict):
+        raise RuntimeError(f"unexpected completion response: {type(r)}")
+
+    timings = r.get("timings", {}) or {}
+    drafted, accepted = speculative_counts(r, timings)
+    predicted_n = timings.get("predicted_n")
+    full_generation = (
+        not fixed_length
+        or (isinstance(predicted_n, (int, float)) and predicted_n >= n_predict)
+    )
+
     return {
         "wall_s": wall,
         "prompt_n": timings.get("prompt_n"),
         "pp": timings.get("prompt_per_second"),
-        "predicted_n": timings.get("predicted_n"),
+        "predicted_n": predicted_n,
         "tg": timings.get("predicted_per_second"),
         "drafted": drafted,
         "accepted": accepted,
-        "content": r.get("content", "") if isinstance(r, dict) else str(r),
+        "full_generation": full_generation,
+        "content": r.get("content", ""),
     }
 
 
@@ -178,7 +196,7 @@ def run_leg(base_url: str, model: str, pp_tokens: list[int], tg_predict: int, re
         prompt = exact_prompt(base_url, model, n)
         rows = []
         for _ in range(repeats):
-            rows.append(one_completion(base_url, model, prompt, 1))
+            rows.append(one_completion(base_url, model, prompt, 1, fixed_length=False))
         result["pp"][str(n)] = rows
 
     workloads = [
@@ -189,7 +207,12 @@ def run_leg(base_url: str, model: str, pp_tokens: list[int], tg_predict: int, re
     for name, prompt in workloads:
         rows = []
         for _ in range(repeats):
-            row = one_completion(base_url, model, prompt, tg_predict)
+            row = one_completion(base_url, model, prompt, tg_predict, fixed_length=True)
+            if not row["full_generation"]:
+                raise RuntimeError(
+                    f"{model}/{name}: fixed TG requested {tg_predict} tokens but server reported "
+                    f"predicted_n={row['predicted_n']}; refusing to trust this timing"
+                )
             row["workload"] = name
             rows.append(row)
         result["tg"].extend(rows)
@@ -240,18 +263,17 @@ def main():
         "url": args.url,
         "sequence": sequence,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "fixed_tg": True,
+        "requested_tg": args.tg,
         "legs": [],
     }
 
     previous = None
     for idx, model in enumerate(sequence, 1):
         print(f"\n=== leg {idx}/{len(sequence)}: {model} ===", flush=True)
-        # Only unload the Flash Next model involved in the previous leg. Never use
-        # the global unload endpoint because another production model may be live.
         if previous is not None:
             unload_model(args.url, previous, args.force)
             time.sleep(3)
-        # Also ensure a stale instance of the upcoming alias is gone before timing.
         unload_model(args.url, model, args.force)
         time.sleep(2)
 
