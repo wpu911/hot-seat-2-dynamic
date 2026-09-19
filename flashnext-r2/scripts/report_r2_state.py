@@ -20,6 +20,8 @@ MTP = "qwen3.8-flash-next-r2-modern-mtp:256k"
 FINAL = "qwen3.8-flash-next-r2-final-pre-sweep:256k"
 LAYER = "qwen3.8-flash-next-r2-split-layer:256k"
 TENSOR = "qwen3.8-flash-next-r2-split-tensor-1x1:256k"
+INV_MID = "qwen3.8-flash-next-r2-split-tensor-inv-mid:256k"
+INV_CAP = "qwen3.8-flash-next-r2-split-tensor-inv-cap:256k"
 
 
 def env_file(path: Path | None) -> dict[str, str]:
@@ -97,6 +99,7 @@ def main():
     phase3_manifest = root / "llama.cpp-flashnext-r2-final-pre-sweep-20260919/r2-meta/phase3-compose-manifest.txt"
     phase6_manifest = root / "llama.cpp-flashnext-r2-tensor-split-20260919/r2-meta/phase6-tensor-split-manifest.txt"
     ratio_manifest = root / "llama.cpp-flashnext-r2-tensor-split-20260919/r2-meta/phase6b-ratios.env"
+    ratio_meta = env_file(ratio_manifest)
 
     foundation_analysis = logs / "flashnext-r2-modern-foundation-ab.foundation-analysis.json"
     p1 = latest(str(logs / "flashnext-r2-phase1-*/summary.env")); p1d = env_file(p1)
@@ -107,14 +110,33 @@ def main():
     p5 = latest(str(logs / "flashnext-r2-phase5-gdn-*/summary.env")); p5d = env_file(p5)
     p6 = latest(str(logs / "flashnext-r2-phase6-tensor-split-*/summary.env")); p6d = env_file(p6)
     p6b = latest(str(logs / "flashnext-r2-phase6b-ratio-*/summary.env")); p6bd = env_file(p6b)
+    ppar = latest(str(logs / "flashnext-r2-mtp-parallel-isolation-*/summary.env")); ppard = env_file(ppar)
     poc = latest(str(logs / "flashnext-r2-final-openclaw-*/summary.env")); pocd = env_file(poc)
     prev = latest(str(logs / "flashnext-r2-promotion-review-*/summary.env")); prevd = env_file(prev)
 
-    p6b_current = p6d.get("PHASE6_WINNER_MODE") == "TENSOR_1x1" and newer_or_equal(p6b, p6)
+    ratio_manifest_v2 = (
+        ratio_manifest.is_file()
+        and bool(ratio_meta.get("INV_MID_RATIO"))
+        and bool(ratio_meta.get("INV_CAP_RATIO"))
+        and INV_MID in aliases
+        and INV_CAP in aliases
+    )
+    p6b_current = (
+        p6d.get("PHASE6_WINNER_MODE") == "TENSOR_1x1"
+        and ratio_manifest_v2
+        and newer_or_equal(p6b, p6)
+    )
     effective_p6bd = p6bd if p6b_current else {}
     final_winner = effective_p6bd.get("PHASE6B_WINNER_ALIAS") or p6d.get("PHASE6_WINNER_ALIAS") or p5d.get("PHASE5_WINNER_ALIAS")
     winner_parent = p6b if p6b_current else (p6 or p5)
-    openclaw_current = newer_or_equal(poc, winner_parent)
+    parallel_current = newer_or_equal(ppar, winner_parent)
+    parallel_pass = (
+        parallel_current
+        and ppard.get("MTP_PARALLEL_ISOLATION") == "PASS"
+        and ppard.get("WINNER_ALIAS") == final_winner
+    )
+    openclaw_parent = ppar if parallel_pass else winner_parent
+    openclaw_current = newer_or_equal(poc, openclaw_parent)
     promotion_review_current = newer_or_equal(prev, poc)
 
     print("=== Flash Next R2 state report ===")
@@ -127,8 +149,10 @@ def main():
     print(f"phase3_manifest={phase3_manifest.is_file()} alias={FINAL in aliases}")
     print(f"phase6_manifest={phase6_manifest.is_file()} layer_alias={LAYER in aliases} tensor_alias={TENSOR in aliases}")
     print(f"phase6b_ratio_manifest={ratio_manifest.is_file()}")
+    print(f"phase6b_bidirectional_ready={ratio_manifest_v2}")
     print(f"phase6b_summary_current={p6b_current}")
     print(f"effective_final_winner={final_winner}")
+    print(f"mtp_parallel_gate_current={parallel_current} pass={parallel_pass}")
     print()
 
     show_summary("phase1", p1, p1d, ("FOUNDATION_RESULT","MTP_RESULT","TOPK_SMOKE_RESULT","TOPK_FULL_RESULT","PRODUCTION_PROMOTED","FINISHED"))
@@ -138,14 +162,15 @@ def main():
     show_summary("phase4b", p4b, p4bd, ("PARAM_ALIAS","LONG_GATE","CACHED_GATE","ROLLBACK_GATE","PARAM_ACCEPTED","FALLBACK_REASON","PHASE4B_WINNER_ALIAS","VALIDATION","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase5", p5, p5d, ("THROUGHPUT_MODE","CACHED_GATE","ROLLBACK_GATE","PHASE5_WINNER_MODE","PHASE5_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("phase6", p6, p6d, ("SHORT_GATE_RC","LONG_GATE_RC","CACHED_GATE","ROLLBACK_GATE","PHASE6_WINNER_MODE","PHASE6_WINNER_ALIAS","PRODUCTION_PROMOTED","FINISHED"))
-    show_summary("phase6b", p6b, p6bd, ("PHASE6B_WINNER_RATIO","PHASE6B_WINNER_ALIAS","CONFIRM_SHORT","CONFIRM_LONG","CACHED_GATE","ROLLBACK_GATE","PRODUCTION_PROMOTED","FINISHED"))
+    show_summary("phase6b", p6b, p6bd, ("SMOKE_DECISION","SMOKE_GAIN_PCT","PHASE6B_WINNER_RATIO","PHASE6B_WINNER_ALIAS","CONFIRM_SHORT","CONFIRM_LONG","CACHED_GATE","ROLLBACK_GATE","PRODUCTION_PROMOTED","FINISHED"))
+    show_summary("mtp-parallel", ppar, ppard, ("MTP_PARALLEL_ISOLATION","WINNER_ALIAS","UPSTREAM_SLOTS","MODE","RESULT","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("openclaw", poc, pocd, ("OPENCLAW_REGRESSION","WINNER_ALIAS","PROVIDER_MODEL","RESULT","PRODUCTION_PROMOTED","FINISHED"))
     show_summary("promotion-review", prev, prevd, ("PROMOTION_REVIEW","WINNER_ALIAS","CONFIG_SHA256","REVIEW_DIR","PRODUCTION_PROMOTED","FINISHED"))
 
     warnings = []
     if PROD not in aliases:
         warnings.append("production alias is missing")
-    for name, d in (("phase1",p1d),("phase2",p2d),("phase3",p3d),("phase4",p4d),("phase4b",p4bd),("phase5",p5d),("phase6",p6d),("phase6b",p6bd),("openclaw",pocd),("promotion-review",prevd)):
+    for name, d in (("phase1",p1d),("phase2",p2d),("phase3",p3d),("phase4",p4d),("phase4b",p4bd),("phase5",p5d),("phase6",p6d),("phase6b",p6bd),("mtp-parallel",ppard),("openclaw",pocd),("promotion-review",prevd)):
         if d.get("PRODUCTION_PROMOTED") not in (None, "NO"):
             warnings.append(f"{name} says PRODUCTION_PROMOTED={d.get('PRODUCTION_PROMOTED')}")
     if warnings:
@@ -190,21 +215,24 @@ def main():
     elif not p6d.get("PHASE6_WINNER_MODE"):
         nxt = "bash flashnext-r2/scripts/run_phase6_verified.sh"
         why = "Phase-6 runtimes exist but verified layer-vs-tensor A/B is incomplete."
-    elif p6d.get("PHASE6_WINNER_MODE") == "TENSOR_1x1" and not ratio_manifest.is_file():
+    elif p6d.get("PHASE6_WINNER_MODE") == "TENSOR_1x1" and not ratio_manifest_v2:
         nxt = "bash flashnext-r2/scripts/prepare_phase6b_tensor_ratio_sweep.sh"
-        why = "Tensor 1:1 won; heterogeneous ratio arms are not prepared."
+        why = "Tensor 1:1 won, but the five-arm bidirectional heterogeneous ratio set is not prepared."
     elif p6d.get("PHASE6_WINNER_MODE") == "TENSOR_1x1" and (not p6b_current or not p6bd.get("PHASE6B_WINNER_ALIAS")):
         nxt = "bash flashnext-r2/scripts/run_phase6b_verified.sh"
-        why = "Tensor 1:1 won, but the Phase-6b result is absent or older than the current Phase-6 decision."
+        why = "Tensor 1:1 won, but the current bidirectional Phase-6b result is absent or older than Phase-6."
+    elif not parallel_pass:
+        nxt = "python3 flashnext-r2/scripts/run_mtp_parallel_isolation.py"
+        why = f"winner {final_winner or 'UNKNOWN'} has not passed the current draft-MTP multi-slot isolation gate (upstream issue #28286)."
     elif not openclaw_current or pocd.get("OPENCLAW_REGRESSION") != "PASS" or pocd.get("WINNER_ALIAS") != final_winner:
         nxt = "python3 flashnext-r2/scripts/run_final_openclaw_regression.py"
-        why = f"llama-swap winner {final_winner or 'UNKNOWN'} has not passed a matching current OpenClaw Gateway session regression."
+        why = f"llama-swap winner {final_winner or 'UNKNOWN'} passed slot isolation but not a matching current OpenClaw Gateway session regression."
     elif not promotion_review_current or prevd.get("PROMOTION_REVIEW") != "READY" or prevd.get("WINNER_ALIAS") != final_winner:
         nxt = "python3 flashnext-r2/scripts/prepare_promotion_review.py"
         why = "The current OpenClaw-validated winner does not yet have a matching read-only production promotion review bundle."
     else:
         nxt = f"READY_FOR_EXPLICIT_PROMOTION winner={final_winner or 'UNKNOWN'} review={prevd.get('REVIEW_DIR','UNKNOWN')}"
-        why = "All automated R2 gates passed and a current immutable promotion review was generated. Production remains unchanged until an explicit promotion action."
+        why = "All R2 performance/correctness, multi-slot isolation, OpenClaw and review gates passed. Production remains unchanged until an explicit promotion action."
 
     print("\nDECISION")
     print(f"WHY={why}")
