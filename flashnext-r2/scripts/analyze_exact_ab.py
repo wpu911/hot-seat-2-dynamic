@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Generic exact-output A/B analyzer for Flash Next R2 stages."""
+"""Generic exact-output A/B analyzer for Flash Next R2 stages.
+
+This gate is used by short-context comparison stages such as Phase-6 tensor
+split. It therefore rejects stale pre-schema results, truncated generations and
+missing MTP counters instead of silently treating absent data as acceptable.
+"""
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
 import statistics
+
+WORKLOADS = ("zh", "code", "tool")
 
 
 def med(xs):
@@ -30,21 +37,42 @@ def collect(data, model):
         pp[k] = med(vals)
 
     tg, outputs, acceptance = {}, {}, {}
-    for workload in ("zh", "code", "tool"):
-        tvals, outs, avals = [], [], []
+    tg_samples, acceptance_samples, full_generation = {}, {}, {}
+    requested = data.get("requested_tg")
+    for workload in WORKLOADS:
+        rows = []
         for leg in legs:
-            for row in leg.get("tg", []):
-                if row.get("workload") != workload:
-                    continue
-                tvals.append(row.get("tg"))
-                outs.append(row.get("content", ""))
-                d, a = row.get("drafted"), row.get("accepted")
-                if isinstance(d, (int, float)) and d > 0 and isinstance(a, (int, float)):
-                    avals.append(a / d)
+            rows.extend(r for r in leg.get("tg", []) if r.get("workload") == workload)
+        tvals = [r.get("tg") for r in rows]
+        outs = [r.get("content", "") for r in rows]
+        avals = []
+        for row in rows:
+            d, a = row.get("drafted"), row.get("accepted")
+            if isinstance(d, (int, float)) and d > 0 and isinstance(a, (int, float)):
+                avals.append(a / d)
         tg[workload] = med(tvals)
         outputs[workload] = outs
         acceptance[workload] = med(avals)
-    return {"legs": len(legs), "pp": pp, "tg": tg, "outputs": outputs, "acceptance": acceptance}
+        tg_samples[workload] = len(rows)
+        acceptance_samples[workload] = len(avals)
+        full = bool(rows) and all(r.get("full_generation") is True for r in rows)
+        if isinstance(requested, (int, float)):
+            full = full and all(
+                isinstance(r.get("predicted_n"), (int, float)) and r.get("predicted_n") >= requested
+                for r in rows
+            )
+        full_generation[workload] = full
+
+    return {
+        "legs": len(legs),
+        "pp": pp,
+        "tg": tg,
+        "outputs": outputs,
+        "acceptance": acceptance,
+        "tg_samples": tg_samples,
+        "acceptance_samples": acceptance_samples,
+        "full_generation": full_generation,
+    }
 
 
 def all_same(xs):
@@ -60,27 +88,64 @@ def main():
     ap.add_argument("--min-median-tg-gain", type=float, default=0.5)
     ap.add_argument("--max-workload-tg-loss", type=float, default=1.5)
     ap.add_argument("--max-median-pp-loss", type=float, default=2.0)
+    ap.add_argument("--max-acceptance-drop-pp", type=float, default=3.0)
     args = ap.parse_args()
 
     data = json.loads(Path(args.result).read_text(encoding="utf-8"))
+    schema_ok = (
+        isinstance(data.get("schema_version"), int)
+        and data.get("schema_version") >= 3
+        and data.get("fixed_tg") is True
+        and isinstance(data.get("requested_tg"), (int, float))
+        and data.get("requested_tg") > 0
+    )
+
     b, r = collect(data, args.baseline), collect(data, args.r2)
-    pp_delta = {k: pct(r["pp"].get(k), b["pp"].get(k)) for k in sorted(set(b["pp"]) | set(r["pp"]), key=lambda x: int(x))}
-    tg_delta = {w: pct(r["tg"].get(w), b["tg"].get(w)) for w in ("zh", "code", "tool")}
+    pp_delta = {
+        k: pct(r["pp"].get(k), b["pp"].get(k))
+        for k in sorted(set(b["pp"]) | set(r["pp"]), key=lambda x: int(x))
+    }
+    tg_delta = {w: pct(r["tg"].get(w), b["tg"].get(w)) for w in WORKLOADS}
 
     exact = {}
-    for w in ("zh", "code", "tool"):
+    acc_delta = {}
+    sample_ok = {}
+    full_ok = {}
+    acceptance_ok = {}
+    for w in WORKLOADS:
         bo, ro = b["outputs"].get(w, []), r["outputs"].get(w, [])
         exact[w] = all_same(bo) and all_same(ro) and bo[0] == ro[0]
+        ba, ra = b["acceptance"].get(w), r["acceptance"].get(w)
+        acc_delta[w] = None if ba is None or ra is None else (ra - ba) * 100.0
+        sample_ok[w] = b["tg_samples"].get(w, 0) > 0 and r["tg_samples"].get(w, 0) > 0
+        full_ok[w] = bool(b["full_generation"].get(w)) and bool(r["full_generation"].get(w))
+        acceptance_ok[w] = (
+            sample_ok[w]
+            and b["acceptance_samples"].get(w, 0) == b["tg_samples"].get(w, 0)
+            and r["acceptance_samples"].get(w, 0) == r["tg_samples"].get(w, 0)
+            and isinstance(ba, (int, float)) and isinstance(ra, (int, float))
+        )
 
-    pp_med = med(list(pp_delta.values()))
-    tg_med = med(list(tg_delta.values()))
-    tg_worst = min([x for x in tg_delta.values() if isinstance(x, (int, float))], default=None)
-    passed = (
-        all(exact.values()) and
-        tg_med is not None and tg_med >= args.min_median_tg_gain and
-        (tg_worst is None or tg_worst >= -args.max_workload_tg_loss) and
-        (pp_med is None or pp_med >= -args.max_median_pp_loss)
-    )
+    pp_vals = [x for x in pp_delta.values() if isinstance(x, (int, float))]
+    tg_vals = [x for x in tg_delta.values() if isinstance(x, (int, float))]
+    acc_vals = [x for x in acc_delta.values() if isinstance(x, (int, float))]
+    pp_med = med(pp_vals)
+    tg_med = med(tg_vals)
+    tg_worst = min(tg_vals) if tg_vals else None
+    acc_worst = min(acc_vals) if acc_vals else None
+
+    checks = {
+        "schema": schema_ok,
+        "samples": all(sample_ok.values()),
+        "fixed_generation": all(full_ok.values()),
+        "bit_exact": all(exact.values()),
+        "acceptance_present": all(acceptance_ok.values()),
+        "acceptance": acc_worst is not None and acc_worst >= -args.max_acceptance_drop_pp,
+        "median_tg": tg_med is not None and tg_med >= args.min_median_tg_gain,
+        "worst_tg": tg_worst is not None and tg_worst >= -args.max_workload_tg_loss,
+        "median_pp": pp_med is not None and pp_med >= -args.max_median_pp_loss,
+    }
+    passed = all(checks.values())
 
     report = {
         "label": args.label,
@@ -89,24 +154,33 @@ def main():
         "baseline_metrics": {k: v for k, v in b.items() if k != "outputs"},
         "r2_metrics": {k: v for k, v in r.items() if k != "outputs"},
         "delta_pct": {"pp": pp_delta, "tg": tg_delta},
+        "acceptance_delta_percentage_points": acc_delta,
         "bit_exact": exact,
         "gate": {
             "result": "PASS" if passed else "FAIL",
+            "checks": checks,
+            "schema_version": data.get("schema_version"),
             "median_tg_gain_pct": tg_med,
             "worst_tg_delta_pct": tg_worst,
             "median_pp_delta_pct": pp_med,
+            "worst_acceptance_delta_pp": acc_worst,
             "min_median_tg_gain_pct": args.min_median_tg_gain,
             "max_workload_tg_loss_pct": args.max_workload_tg_loss,
             "max_median_pp_loss_pct": args.max_median_pp_loss,
+            "max_acceptance_drop_pp": args.max_acceptance_drop_pp,
         },
     }
 
     print(f"label={args.label} baseline_legs={b['legs']} r2_legs={r['legs']}")
-    for w in ("zh", "code", "tool"):
-        print(f"TG {w:>4}: {b['tg'].get(w)} -> {r['tg'].get(w)} delta={tg_delta[w]}% exact={exact[w]}")
+    for w in WORKLOADS:
+        print(
+            f"TG {w:>4}: {b['tg'].get(w)} -> {r['tg'].get(w)} "
+            f"delta={tg_delta[w]}% exact={exact[w]} full={full_ok[w]} "
+            f"accΔ={acc_delta[w]}pp"
+        )
     for k in sorted(pp_delta, key=lambda x: int(x)):
         print(f"PP {k:>5}: {b['pp'].get(k)} -> {r['pp'].get(k)} delta={pp_delta[k]}%")
-    print(f"GATE median_tg={tg_med}% worst_tg={tg_worst}% median_pp={pp_med}% exact={all(exact.values())} result={report['gate']['result']}")
+    print(json.dumps(report["gate"], ensure_ascii=False, indent=2))
 
     out = Path(args.result).with_suffix(f".{args.label}-analysis.json")
     out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
