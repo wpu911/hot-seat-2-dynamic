@@ -179,16 +179,22 @@ cmake -S "$FOUNDATION" -B "$BUILD" \
 cmake --build "$BUILD" -j"${JOBS:-$(nproc)}" --target llama-server test-backend-ops
 
 test -x "$BUILD/bin/llama-server" || { echo "ERROR: llama-server missing" >&2; exit 20; }
-mkdir -p "$RUNTIME"
-cp -a "$BUILD/bin/." "$RUNTIME/"
-sha256sum "$RUNTIME/llama-server" | tee "$FOUNDATION/r2-meta/modern-foundation-llama-server.sha256"
-"$RUNTIME/llama-server" --version | tee "$FOUNDATION/r2-meta/modern-foundation-version.txt" || true
 
 if [[ -x "$BUILD/bin/test-backend-ops" ]]; then
   "$BUILD/bin/test-backend-ops" test -o TOP_K -b ROCm0 \
     || "$BUILD/bin/test-backend-ops" test -o TOP_K -b HIP0 \
     || "$BUILD/bin/test-backend-ops" test -o TOP_K
 fi
+
+# Stage a genuinely private runtime. The old plain `cp build/bin` path could
+# retain a CMake RUNPATH back into build-r2-*; that works right up until somebody
+# cleans the build tree, which is a charming way to discover dependency hygiene.
+REQUIRE_BOTH_GPUS="${REQUIRE_BOTH_GPUS:-1}" \
+  bash "$SCRIPT_DIR/stage_runtime_bundle.sh" \
+    "$BUILD/bin" "$RUNTIME" "$FOUNDATION/r2-meta/runtime-bundle"
+
+sha256sum "$RUNTIME/llama-server" | tee "$FOUNDATION/r2-meta/modern-foundation-llama-server.sha256"
+"$RUNTIME/llama-server" --version | tee "$FOUNDATION/r2-meta/modern-foundation-version.txt" || true
 
 python3 "$SCRIPT_DIR/install_llamaswap_r2_alias.py" \
   --config "$CONFIG" --source-alias "$SOURCE_ALIAS" \
